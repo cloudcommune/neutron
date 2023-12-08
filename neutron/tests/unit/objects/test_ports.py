@@ -11,7 +11,6 @@
 #    under the License.
 
 import mock
-import netaddr
 from neutron_lib import constants
 from neutron_lib.tests import tools
 from oslo_utils import uuidutils
@@ -546,59 +545,3 @@ class PortDbObjectTestCase(obj_test_base.BaseDbObjectTestCase,
                 self.context, network_id,
                 binding_types=['vif_type1', 'vif_type2'],
                 negative_search=True))
-
-    def test_get_ports_allocated_by_subnet_id(self):
-        network_id = self._create_test_network_id()
-        segment_id = self._create_test_segment_id(network_id)
-        subnet_id = self._create_test_subnet_id(network_id)
-        self.update_obj_fields(
-            {'network_id': network_id,
-             'fixed_ips': {'subnet_id': subnet_id,
-                           'network_id': network_id},
-             'device_owner': 'not_a_router',
-             'binding_levels': {'segment_id': segment_id}},
-            db_objs=[self.db_objs[0]])
-
-        objs = []
-        for idx in range(3):
-            objs.append(self._make_object(self.obj_fields[idx]))
-            objs[idx].create()
-
-        ipa = ports.IPAllocation(self.context, port_id=objs[0].id,
-                                 subnet_id=subnet_id, network_id=network_id,
-                                 ip_address=netaddr.IPAddress('10.0.0.1'))
-        ipa.create()
-
-        ports_alloc = ports.Port.get_ports_allocated_by_subnet_id(self.context,
-                                                                  subnet_id)
-        self.assertEqual(1, len(ports_alloc))
-        self.assertEqual(objs[0].id, ports_alloc[0].id)
-
-    def _test_get_auto_deletable_ports(self, device_owner):
-        network_id = self._create_test_network_id()
-        segment_id = self._create_test_segment_id(network_id)
-        port = self._create_test_port(device_owner=device_owner)
-        binding = ports.PortBindingLevel(
-            self.context, port_id=port.id,
-            host='host1', level=0, segment_id=segment_id)
-        binding.create()
-        return (
-            ports.Port.
-            get_auto_deletable_port_ids_and_proper_port_count_by_segment(
-                self.context, segment_id))
-
-    def test_get_auto_deletable_ports_dhcp(self):
-        dhcp_ports, count = self._test_get_auto_deletable_ports(
-            'network:dhcp')
-        self.assertEqual(
-            (1, 0),
-            (len(dhcp_ports), count),
-        )
-
-    def test_get_auto_deletable_ports_not_dhcp(self):
-        dhcp_ports, count = self._test_get_auto_deletable_ports(
-            'not_network_dhcp')
-        self.assertEqual(
-            (0, 1),
-            (len(dhcp_ports), count),
-        )

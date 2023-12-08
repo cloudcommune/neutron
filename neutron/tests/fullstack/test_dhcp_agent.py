@@ -36,7 +36,6 @@ class BaseDhcpAgentTest(base.BaseFullStackTestCase):
         (constants.AGENT_TYPE_LINUXBRIDGE,
          {'l2_agent_type': constants.AGENT_TYPE_LINUXBRIDGE})
     ]
-    api_workers = 1
 
     def setUp(self):
         host_descriptions = [
@@ -49,8 +48,7 @@ class BaseDhcpAgentTest(base.BaseFullStackTestCase):
             environment.EnvironmentDescription(
                 l2_pop=False,
                 arp_responder=False,
-                agent_down_time=self.agent_down_time,
-                api_workers=self.api_workers),
+                agent_down_time=self.agent_down_time),
             host_descriptions)
 
         super(BaseDhcpAgentTest, self).setUp(env)
@@ -137,7 +135,7 @@ class TestDhcpAgentHA(BaseDhcpAgentTest):
                 return network_agents[0]['id'] != old_agent['id']
             return False
 
-        common_utils.wait_until_true(_agent_rescheduled, timeout=120)
+        common_utils.wait_until_true(_agent_rescheduled)
 
     def _kill_dhcp_agent(self, agent):
         for host in self.environment.hosts:

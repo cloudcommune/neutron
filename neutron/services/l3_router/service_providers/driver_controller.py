@@ -224,7 +224,7 @@ class DriverController(object):
         distributed = _is_distributed(
             router.get('distributed', lib_const.ATTR_NOT_SPECIFIED))
         ha = _is_ha(router.get('ha', lib_const.ATTR_NOT_SPECIFIED))
-        drivers = list(self.drivers.values())
+        drivers = self.drivers.values()
         # make sure default is tried before the rest if defined
         if self.default_provider:
             drivers.insert(0, self.drivers[self.default_provider])

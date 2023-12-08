@@ -26,7 +26,6 @@ from neutron_lib import exceptions
 from neutron_lib import rpc as n_rpc
 from oslo_concurrency import lockutils
 from oslo_config import cfg
-from oslo_log import helpers as log_helpers
 from oslo_log import log as logging
 import oslo_messaging
 from oslo_service import loopingcall
@@ -74,36 +73,6 @@ def _wait_if_syncing(f):
     return wrapped
 
 
-class DHCPResourceUpdate(queue.ResourceUpdate):
-
-    def __init__(self, _id, priority, action=None, resource=None,
-                 timestamp=None, tries=5, obj_type=None):
-        super(DHCPResourceUpdate, self).__init__(
-            _id, priority, action=action, resource=resource,
-            timestamp=timestamp, tries=tries)
-        self.obj_type = obj_type
-
-    def __lt__(self, other):
-        if other.obj_type == self.obj_type == 'port':
-            # NOTE(ralonsoh): both resources should have "fixed_ips"
-            # information. That key was added to the deleted ports in this
-            # patch but this code runs in the Neutron API (server). Both the
-            # server and the DHCP agent should be updated.
-            # This check could be removed in Y release.
-            if ('fixed_ips' not in self.resource or
-                    'fixed_ips' not in other.resource):
-                return super(DHCPResourceUpdate, self).__lt__(other)
-
-            self_ips = set(str(fixed_ip['ip_address']) for
-                           fixed_ip in self.resource['fixed_ips'])
-            other_ips = set(str(fixed_ip['ip_address']) for
-                            fixed_ip in other.resource['fixed_ips'])
-            if self_ips & other_ips:
-                return self.timestamp < other.timestamp
-
-        return super(DHCPResourceUpdate, self).__lt__(other)
-
-
 class DhcpAgent(manager.Manager):
     """DHCP agent service manager.
 
@@ -119,7 +88,6 @@ class DhcpAgent(manager.Manager):
         super(DhcpAgent, self).__init__(host=host)
         self.needs_resync_reasons = collections.defaultdict(list)
         self.dhcp_ready_ports = set()
-        self.dhcp_prio_ready_ports = set()
         self.conf = conf or cfg.CONF
         # If 'resync_throttle' is configured more than 'resync_interval' by
         # mistake, raise exception and log with message.
@@ -275,32 +243,23 @@ class DhcpAgent(manager.Manager):
     def _dhcp_ready_ports_loop(self):
         """Notifies the server of any ports that had reservations setup."""
         while True:
-            # this is just watching sets so we can do it really frequently
+            # this is just watching a set so we can do it really frequently
             eventlet.sleep(0.1)
-            prio_ports_to_send = set()
-            ports_to_send = set()
-            for port_count in range(min(len(self.dhcp_prio_ready_ports) +
-                                        len(self.dhcp_ready_ports),
-                                        DHCP_READY_PORTS_SYNC_MAX)):
-                if self.dhcp_prio_ready_ports:
-                    prio_ports_to_send.add(self.dhcp_prio_ready_ports.pop())
-                    continue
-                ports_to_send.add(self.dhcp_ready_ports.pop())
-            if prio_ports_to_send or ports_to_send:
+            if self.dhcp_ready_ports:
+                ports_to_send = set()
+                for port_count in range(min(len(self.dhcp_ready_ports),
+                                            DHCP_READY_PORTS_SYNC_MAX)):
+                    ports_to_send.add(self.dhcp_ready_ports.pop())
+
                 try:
-                    self.plugin_rpc.dhcp_ready_on_ports(prio_ports_to_send |
-                                                        ports_to_send)
+                    self.plugin_rpc.dhcp_ready_on_ports(ports_to_send)
                     LOG.info("DHCP configuration for ports %s is completed",
-                             prio_ports_to_send | ports_to_send)
+                             ports_to_send)
                     continue
-                except oslo_messaging.MessagingTimeout:
-                    LOG.error("Timeout notifying server of ports ready. "
-                              "Retrying...")
                 except Exception:
                     LOG.exception("Failure notifying DHCP server of "
                                   "ready DHCP ports. Will retry on next "
                                   "iteration.")
-                self.dhcp_prio_ready_ports |= prio_ports_to_send
                 self.dhcp_ready_ports |= ports_to_send
 
     def start_ready_ports_loop(self):
@@ -437,28 +396,28 @@ class DhcpAgent(manager.Manager):
 
     def network_create_end(self, context, payload):
         """Handle the network.create.end notification event."""
-        update = DHCPResourceUpdate(payload['network']['id'],
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_network_create',
-                                    resource=payload, obj_type='network')
+        update = queue.ResourceUpdate(payload['network']['id'],
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_network_create',
+                                      resource=payload)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _network_create(self, payload):
         network_id = payload['network']['id']
         self.enable_dhcp_helper(network_id)
 
     def network_update_end(self, context, payload):
         """Handle the network.update.end notification event."""
-        update = DHCPResourceUpdate(payload['network']['id'],
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_network_update',
-                                    resource=payload, obj_type='network')
+        update = queue.ResourceUpdate(payload['network']['id'],
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_network_update',
+                                      resource=payload)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _network_update(self, payload):
         network_id = payload['network']['id']
         if payload['network']['admin_state_up']:
@@ -468,28 +427,28 @@ class DhcpAgent(manager.Manager):
 
     def network_delete_end(self, context, payload):
         """Handle the network.delete.end notification event."""
-        update = DHCPResourceUpdate(payload['network_id'],
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_network_delete',
-                                    resource=payload, obj_type='network')
+        update = queue.ResourceUpdate(payload['network_id'],
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_network_delete',
+                                      resource=payload)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _network_delete(self, payload):
         network_id = payload['network_id']
         self.disable_dhcp_helper(network_id)
 
     def subnet_update_end(self, context, payload):
         """Handle the subnet.update.end notification event."""
-        update = DHCPResourceUpdate(payload['subnet']['network_id'],
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_subnet_update',
-                                    resource=payload, obj_type='subnet')
+        update = queue.ResourceUpdate(payload['subnet']['network_id'],
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_subnet_update',
+                                      resource=payload)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _subnet_update(self, payload):
         network_id = payload['subnet']['network_id']
         self.refresh_dhcp_helper(network_id)
@@ -520,14 +479,14 @@ class DhcpAgent(manager.Manager):
         network_id = self._get_network_lock_id(payload)
         if not network_id:
             return
-        update = DHCPResourceUpdate(network_id,
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_subnet_delete',
-                                    resource=payload, obj_type='subnet')
+        update = queue.ResourceUpdate(network_id,
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_subnet_delete',
+                                      resource=payload)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _subnet_delete(self, payload):
         network_id = self._get_network_lock_id(payload)
         if not network_id:
@@ -564,19 +523,17 @@ class DhcpAgent(manager.Manager):
     def port_update_end(self, context, payload):
         """Handle the port.update.end notification event."""
         updated_port = dhcp.DictModel(payload['port'])
-        if not dhcp.port_requires_dhcp_configuration(updated_port):
-            return
         if self.cache.is_port_message_stale(updated_port):
             LOG.debug("Discarding stale port update: %s", updated_port)
             return
-        update = DHCPResourceUpdate(updated_port.network_id,
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_port_update',
-                                    resource=updated_port, obj_type='port')
+        update = queue.ResourceUpdate(updated_port.network_id,
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_port_update',
+                                      resource=updated_port)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _port_update(self, updated_port):
         if self.cache.is_port_message_stale(updated_port):
             LOG.debug("Discarding stale port update: %s", updated_port)
@@ -584,14 +541,10 @@ class DhcpAgent(manager.Manager):
         network = self.cache.get_network_by_id(updated_port.network_id)
         if not network:
             return
-        # treat update as a create event
-        self.reload_allocations(updated_port, network, prio=True)
+        self.reload_allocations(updated_port, network)
 
-    def reload_allocations(self, port, network, prio=False):
-        LOG.info("Trigger reload_allocations for port %s on network %s",
-                 port, network)
-        if not dhcp.port_requires_dhcp_configuration(port):
-            return
+    def reload_allocations(self, port, network):
+        LOG.info("Trigger reload_allocations for port %s", port)
         driver_action = 'reload_allocations'
         if self._is_port_on_this_agent(port):
             orig = self.cache.get_port_by_id(port['id'])
@@ -616,10 +569,7 @@ class DhcpAgent(manager.Manager):
                 driver_action = 'restart'
         self.cache.put_port(port)
         self.call_driver(driver_action, network)
-        if prio:
-            self.dhcp_prio_ready_ports.add(port.id)
-        else:
-            self.dhcp_ready_ports.add(port.id)
+        self.dhcp_ready_ports.add(port.id)
         self.update_isolated_metadata_proxy(network)
 
     def _is_port_on_this_agent(self, port):
@@ -630,16 +580,14 @@ class DhcpAgent(manager.Manager):
     def port_create_end(self, context, payload):
         """Handle the port.create.end notification event."""
         created_port = dhcp.DictModel(payload['port'])
-        if not dhcp.port_requires_dhcp_configuration(created_port):
-            return
-        update = DHCPResourceUpdate(created_port.network_id,
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_port_create',
-                                    resource=created_port, obj_type='port')
+        update = queue.ResourceUpdate(created_port.network_id,
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_port_create',
+                                      resource=created_port)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _port_create(self, created_port):
         network = self.cache.get_network_by_id(created_port.network_id)
         if not network:
@@ -654,34 +602,25 @@ class DhcpAgent(manager.Manager):
             if (new_ips.intersection(cached_ips) and
                 (created_port['id'] != port_cached['id'] or
                  created_port['mac_address'] != port_cached['mac_address'])):
-                resync_reason = (
-                    "Duplicate IP addresses found, "
-                    "Port in cache: {cache_port_id}, "
-                    "Created port: {port_id}, "
-                    "IPs in cache: {cached_ips}, "
-                    "new IPs: {new_ips}."
-                    "DHCP cache is out of sync").format(
-                        cache_port_id=port_cached['id'],
-                        port_id=created_port['id'],
-                        cached_ips=cached_ips,
-                        new_ips=new_ips)
-                self.schedule_resync(resync_reason, created_port.network_id)
+                self.schedule_resync("Duplicate IP addresses found, "
+                                     "DHCP cache is out of sync",
+                                     created_port.network_id)
                 return
-        self.reload_allocations(created_port, network, prio=True)
+        self.reload_allocations(created_port, network)
 
     def port_delete_end(self, context, payload):
         """Handle the port.delete.end notification event."""
         network_id = self._get_network_lock_id(payload)
         if not network_id:
             return
-        update = DHCPResourceUpdate(network_id,
-                                    payload.get('priority', DEFAULT_PRIORITY),
-                                    action='_port_delete',
-                                    resource=payload, obj_type='port')
+        update = queue.ResourceUpdate(network_id,
+                                      payload.get('priority',
+                                                  DEFAULT_PRIORITY),
+                                      action='_port_delete',
+                                      resource=payload)
         self._queue.add(update)
 
     @_wait_if_syncing
-    @log_helpers.log_method_call
     def _port_delete(self, payload):
         network_id = self._get_network_lock_id(payload)
         if not network_id:
@@ -846,8 +785,8 @@ class DhcpPluginApi(object):
     def dhcp_ready_on_ports(self, port_ids):
         """Notify the server that DHCP is configured for the port."""
         cctxt = self.client.prepare(version='1.5')
-        return cctxt.call(self.context, 'dhcp_ready_on_ports',
-                          port_ids=port_ids)
+        cctxt.cast(self.context, 'dhcp_ready_on_ports',
+                   port_ids=port_ids)
 
     def get_networks(self, filters=None, fields=None):
         """Get networks.

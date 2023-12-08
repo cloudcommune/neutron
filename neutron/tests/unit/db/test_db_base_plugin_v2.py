@@ -441,8 +441,8 @@ class NeutronDbPluginV2TestCase(testlib_api.WebTestCase):
         return subnetpool_res
 
     def _create_port(self, fmt, net_id, expected_res_status=None,
-                     arg_list=None, set_context=False, is_admin=False,
-                     tenant_id=None, **kwargs):
+                     arg_list=None, set_context=False, tenant_id=None,
+                     **kwargs):
         tenant_id = tenant_id or self._tenant_id
         data = {'port': {'network_id': net_id,
                          'tenant_id': tenant_id}}
@@ -466,7 +466,7 @@ class NeutronDbPluginV2TestCase(testlib_api.WebTestCase):
         if set_context and tenant_id:
             # create a specific auth context for this request
             port_req.environ['neutron.context'] = context.Context(
-                '', tenant_id, is_admin=is_admin)
+                '', tenant_id)
 
         port_res = port_req.get_response(self.api)
         if expected_res_status:
@@ -1612,24 +1612,16 @@ fixed_ips=ip_address%%3D%s&fixed_ips=ip_address%%3D%s&fixed_ips=subnet_id%%3D%s
             res = req.get_response(self.api)
             self.assertEqual(webob.exc.HTTPConflict.code, res.status_int)
 
-    def _test_delete_network_port_exists_owned_by_network(self, device_owner):
+    def test_delete_network_port_exists_owned_by_network(self):
         res = self._create_network(fmt=self.fmt, name='net',
                                    admin_state_up=True)
         network = self.deserialize(self.fmt, res)
         network_id = network['network']['id']
         self._create_port(self.fmt, network_id,
-                          device_owner=device_owner)
+                          device_owner=constants.DEVICE_OWNER_DHCP)
         req = self.new_delete_request('networks', network_id)
         res = req.get_response(self.api)
         self.assertEqual(webob.exc.HTTPNoContent.code, res.status_int)
-
-    def test_test_delete_network_port_exists_dhcp(self):
-        self._test_delete_network_port_exists_owned_by_network(
-            constants.DEVICE_OWNER_DHCP)
-
-    def test_test_delete_network_port_exists_fip_gw(self):
-        self._test_delete_network_port_exists_owned_by_network(
-            constants.DEVICE_OWNER_AGENT_GW)
 
     def test_delete_network_port_exists_owned_by_network_race(self):
         res = self._create_network(fmt=self.fmt, name='net',

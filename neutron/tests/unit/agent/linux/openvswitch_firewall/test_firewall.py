@@ -23,7 +23,6 @@ import testtools
 
 from neutron.agent.common import ovs_lib
 from neutron.agent.common import utils
-from neutron.agent import firewall as agent_firewall
 from neutron.agent.linux.openvswitch_firewall import constants as ovsfw_consts
 from neutron.agent.linux.openvswitch_firewall import exceptions
 from neutron.agent.linux.openvswitch_firewall import firewall as ovsfw
@@ -38,18 +37,11 @@ TESTING_VLAN_TAG = 1
 TESTING_SEGMENT = 1000
 
 
-def create_ofport(port_dict, network_type=None,
-                  physical_network=None, segment_id=TESTING_SEGMENT):
-    allowed_pairs_v4 = ovsfw.OFPort._get_allowed_pairs(
-        port_dict, version=constants.IPv4)
-    allowed_pairs_v6 = ovsfw.OFPort._get_allowed_pairs(
-        port_dict, version=constants.IPv6)
+def create_ofport(port_dict, network_type=None, physical_network=None):
     ovs_port = mock.Mock(vif_mac='00:00:00:00:00:00', ofport=1,
-                         port_name="port-name",
-                         allowed_pairs_v4=allowed_pairs_v4,
-                         allowed_pairs_v6=allowed_pairs_v6)
+                         port_name="port-name")
     return ovsfw.OFPort(port_dict, ovs_port, vlan_tag=TESTING_VLAN_TAG,
-                        segment_id=segment_id,
+                        segment_id=TESTING_SEGMENT,
                         network_type=network_type,
                         physical_network=physical_network)
 
@@ -289,50 +281,23 @@ class TestConjIdMap(base.BaseTestCase):
                           constants.IPv6)
 
     def test_delete_sg(self):
-        test_data = [
-            # conj_id: 8
-            ('sg1', 'sg1', constants.INGRESS_DIRECTION, constants.IPv6, 0),
-            # conj_id: 10
-            ('sg1', 'sg1', constants.INGRESS_DIRECTION, constants.IPv6, 1),
-            # conj_id: 12
-            ('sg1', 'sg1', constants.INGRESS_DIRECTION, constants.IPv6, 2),
-            # conj_id: 16
-            ('sg2', 'sg1', constants.EGRESS_DIRECTION, constants.IPv6, 0),
-            # conj_id: 24
-            ('sg1', 'sg3', constants.INGRESS_DIRECTION, constants.IPv6, 0),
-            # conj_id: 36 (and 32 without priority offset, stored in id_map)
-            ('sg3', 'sg4', constants.INGRESS_DIRECTION, constants.IPv4, 2),
-            # conj_id: 40
-            ('sg5', 'sg4', constants.EGRESS_DIRECTION, constants.IPv4, 0),
-        ]
+        test_data = [('sg1', 'sg1'), ('sg1', 'sg2')]
 
         ids = []
-        conj_id_segment = set([])  # see ConjIPFlowManager.get_conj_id
-        # This is similar to ConjIPFlowManager.add method
-        for sg_id, rsg_id, direction, ip_version, prio_offset in test_data:
-            conj_id_tuple = (sg_id, rsg_id, direction, ip_version)
-            conj_id = self.conj_id_map.get_conj_id(*conj_id_tuple)
-            conj_id_segment.add(conj_id)
-            conj_id_plus_prio = conj_id + prio_offset * 2
-            self.conj_id_map.id_map_group[conj_id_tuple].add(conj_id_plus_prio)
-            ids.append(conj_id_plus_prio)
+        for sg_id, remote_sg_id in test_data:
+            ids.append(self.conj_id_map.get_conj_id(
+                sg_id, remote_sg_id,
+                constants.INGRESS_DIRECTION, constants.IPv6))
 
         result = self.conj_id_map.delete_sg('sg1')
-        self.assertEqual(
-            {('sg3', 24), ('sg1', 12), ('sg1', 16), ('sg1', 8), ('sg1', 10)},
-            result)
-        result = self.conj_id_map.delete_sg('sg3')
-        self.assertEqual({('sg4', 32), ('sg4', 36)}, result)
-        result = self.conj_id_map.delete_sg('sg4')
-        self.assertEqual({('sg4', 40)}, result)
-        self.assertEqual({}, self.conj_id_map.id_map)
-        self.assertEqual({}, self.conj_id_map.id_map_group)
+        self.assertIn(('sg1', ids[0]), result)
+        self.assertIn(('sg2', ids[1]), result)
+        self.assertFalse(self.conj_id_map.id_map)
 
-        reallocated = set([])
-        for sg_id, rsg_id, direction, ip_version, _ in test_data:
-            conj_id_tuple = (sg_id, rsg_id, direction, ip_version)
-            reallocated.add(self.conj_id_map.get_conj_id(*conj_id_tuple))
-        self.assertEqual(reallocated, conj_id_segment)
+        reallocated = self.conj_id_map.get_conj_id(
+            'sg-foo', 'sg-foo', constants.INGRESS_DIRECTION,
+            constants.IPv6)
+        self.assertIn(reallocated, ids)
 
 
 class TestConjIPFlowManager(base.BaseTestCase):
@@ -343,9 +308,9 @@ class TestConjIPFlowManager(base.BaseTestCase):
         self.vlan_tag = 100
         self.conj_id = 16
 
-    def test_update_flows_for_vlan_no_members(self):
+    def test_update_flows_for_vlan_no_ports(self):
         remote_group = self.driver.sg_port_map.get_sg.return_value
-        remote_group.members = {}
+        remote_group.ports = {}
         with mock.patch.object(self.manager.conj_id_map,
                                'get_conj_id') as get_conj_id_mock:
             get_conj_id_mock.return_value = self.conj_id
@@ -354,21 +319,6 @@ class TestConjIPFlowManager(base.BaseTestCase):
             self.manager.update_flows_for_vlan(self.vlan_tag)
         self.assertFalse(remote_group.get_ethertype_filtered_addresses.called)
         self.assertFalse(self.driver._add_flow.called)
-
-    def test_update_flows_for_vlan_no_ports_but_members(self):
-        remote_group = self.driver.sg_port_map.get_sg.return_value
-        remote_group.ports = set()
-        remote_group.members = {constants.IPv4: ['10.22.3.4']}
-        remote_group.get_ethertype_filtered_addresses.return_value = [
-            '10.22.3.4']
-        with mock.patch.object(self.manager.conj_id_map,
-                               'get_conj_id') as get_conj_id_mock:
-            get_conj_id_mock.return_value = self.conj_id
-            self.manager.add(self.vlan_tag, 'sg', 'remote_id',
-                             constants.INGRESS_DIRECTION, constants.IPv4, 0)
-            self.manager.update_flows_for_vlan(self.vlan_tag)
-        self.assertTrue(remote_group.get_ethertype_filtered_addresses.called)
-        self.assertTrue(self.driver._add_flow.called)
 
     def test_update_flows_for_vlan(self):
         remote_group = self.driver.sg_port_map.get_sg.return_value
@@ -396,7 +346,7 @@ class TestConjIPFlowManager(base.BaseTestCase):
                        dl_type=2048, nw_src='10.22.3.4/32', priority=73,
                        reg_net=self.vlan_tag, table=82)])
 
-    def _sg_removed(self, sg_name):
+    def test_sg_removed(self):
         with mock.patch.object(self.manager.conj_id_map,
                                'get_conj_id') as get_id_mock, \
              mock.patch.object(self.manager.conj_id_map,
@@ -409,26 +359,11 @@ class TestConjIPFlowManager(base.BaseTestCase):
                 constants.INGRESS_DIRECTION, constants.IPv4)] = {
                     '10.22.3.4': [self.conj_id]}
 
-            self.manager.sg_removed(sg_name)
-
-    def test_sg_removed(self):
-        self._sg_removed('sg')
+            self.manager.sg_removed('sg')
         self.driver._add_flow.assert_not_called()
-        self.driver.delete_flows_for_flow_state.assert_called_once_with(
-            {'10.22.3.4': [self.conj_id]}, {},
-            constants.INGRESS_DIRECTION, constants.IPv4, self.vlan_tag)
-        self.driver.delete_flow_for_ip.assert_not_called()
-
-    def test_remote_sg_removed(self):
-        self._sg_removed('remote_id')
-        self.driver._add_flow.assert_not_called()
-        self.driver.delete_flows_for_flow_state.assert_called_once_with(
-            {'10.22.3.4': [self.conj_id]}, {},
-            constants.INGRESS_DIRECTION, constants.IPv4, self.vlan_tag)
-        # "conj_id_to_remove" is populated with the remote_sg conj_id assigned,
-        # "_update_flows_for_vlan_subr" will call "delete_flow_for_ip".
-        self.driver.delete_flow_for_ip.assert_called_once_with(
-            '10.22.3.4', 'ingress', 'IPv4', 100, {self.conj_id})
+        self.driver.delete_flows_for_ip_addresses.assert_called_once_with(
+            {'10.22.3.4'}, constants.INGRESS_DIRECTION, constants.IPv4,
+            self.vlan_tag)
 
 
 class FakeOVSPort(object):
@@ -445,14 +380,12 @@ class TestOVSFirewallDriver(base.BaseTestCase):
             ovs_lib, 'OVSBridge', autospec=True).start()
         securitygroups_rpc.register_securitygroups_opts()
         self.firewall = ovsfw.OVSFirewallDriver(mock_bridge)
-        self.delete_invalid_conntrack_entries_mock = mock.patch.object(
-            self.firewall.ipconntrack,
-            "delete_conntrack_state_by_remote_ips").start()
         self.mock_bridge = self.firewall.int_br
         self.mock_bridge.reset_mock()
         self.fake_ovs_port = FakeOVSPort('port', 1, '00:00:00:00:00:00')
         self.mock_bridge.br.get_vif_port_by_id.return_value = \
             self.fake_ovs_port
+        cfg.CONF.set_override('explicitly_egress_direct', True, 'AGENT')
 
     def _prepare_security_group(self):
         security_group_rules = [
@@ -471,16 +404,6 @@ class TestOVSFirewallDriver(base.BaseTestCase):
              'remote_group_id': 2,
              'direction': constants.EGRESS_DIRECTION}]
         self.firewall.update_security_group_rules(2, security_group_rules)
-
-    def _assert_invalid_conntrack_entries_deleted(self, port_dict):
-        port_dict['of_port'] = mock.Mock(vlan_tag=10)
-        self.delete_invalid_conntrack_entries_mock.assert_has_calls([
-            mock.call(
-                [port_dict], constants.IPv4, set(),
-                mark=ovsfw_consts.CT_MARK_INVALID),
-            mock.call(
-                [port_dict], constants.IPv6, set(),
-                mark=ovsfw_consts.CT_MARK_INVALID)])
 
     @property
     def port_ofport(self):
@@ -639,7 +562,6 @@ class TestOVSFirewallDriver(base.BaseTestCase):
         calls = self.mock_bridge.br.add_flow.call_args_list
         for call in exp_ingress_classifier, exp_egress_classifier, filter_rule:
             self.assertIn(call, calls)
-        self._assert_invalid_conntrack_entries_deleted(port_dict)
 
     def test_prepare_port_filter_port_security_disabled(self):
         port_dict = {'device': 'port-id',
@@ -650,25 +572,19 @@ class TestOVSFirewallDriver(base.BaseTestCase):
                 self.firewall, 'initialize_port_flows') as m_init_flows:
             self.firewall.prepare_port_filter(port_dict)
         self.assertFalse(m_init_flows.called)
-        self.delete_invalid_conntrack_entries_mock.assert_not_called()
 
-    def _test_initialize_port_flows_dvr_conntrack_direct(self, network_type):
+    def test_initialize_port_flows_vlan_dvr_conntrack_direct(self):
         port_dict = {
             'device': 'port-id',
             'security_groups': [1]}
-        segment_id = None
-        if network_type == constants.TYPE_VLAN:
-            segment_id = TESTING_SEGMENT
         of_port = create_ofport(port_dict,
-                                network_type=network_type,
-                                segment_id=segment_id)
+                                network_type=constants.TYPE_VXLAN)
         self.firewall.sg_port_map.ports[of_port.id] = of_port
         port = self.firewall.get_or_create_ofport(port_dict)
 
         fake_patch_port = 999
         self.mock_bridge.br.get_port_ofport.return_value = fake_patch_port
 
-        expected_calls = []
         self.firewall.initialize_port_flows(port)
 
         call_args1 = {
@@ -683,39 +599,22 @@ class TestOVSFirewallDriver(base.BaseTestCase):
                            port.vlan_tag,
                            ovsfw_consts.REG_NET,
                            ovs_consts.BASE_EGRESS_TABLE)}
-        expected_calls.append(mock.call(**call_args1))
+        egress_flow_call = mock.call(**call_args1)
 
-        if network_type == constants.TYPE_VLAN:
-            call_args2 = {
-                'table': ovs_consts.TRANSIENT_TABLE,
-                'priority': 90,
-                'dl_dst': port.mac,
-                'dl_vlan': '0x%x' % port.segment_id,
-                'actions': 'set_field:{:d}->reg{:d},'
-                           'set_field:{:d}->reg{:d},'
-                           'strip_vlan,resubmit(,{:d})'.format(
-                               port.ofport,
-                               ovsfw_consts.REG_PORT,
-                               port.vlan_tag,
-                               ovsfw_consts.REG_NET,
-                               ovs_consts.BASE_INGRESS_TABLE)}
-            expected_calls.append(mock.call(**call_args2))
-
-        if network_type == constants.TYPE_FLAT:
-            call_args2 = {
-                'table': ovs_consts.TRANSIENT_TABLE,
-                'priority': 90,
-                'dl_dst': port.mac,
-                'vlan_tci': ovs_consts.FLAT_VLAN_TCI,
-                'actions': 'set_field:{:d}->reg{:d},'
-                           'set_field:{:d}->reg{:d},'
-                           'resubmit(,{:d})'.format(
-                               port.ofport,
-                               ovsfw_consts.REG_PORT,
-                               port.vlan_tag,
-                               ovsfw_consts.REG_NET,
-                               ovs_consts.BASE_INGRESS_TABLE)}
-            expected_calls.append(mock.call(**call_args2))
+        call_args2 = {
+            'table': ovs_consts.TRANSIENT_TABLE,
+            'priority': 90,
+            'dl_dst': port.mac,
+            'dl_vlan': '0x%x' % port.segment_id,
+            'actions': 'set_field:{:d}->reg{:d},'
+                       'set_field:{:d}->reg{:d},'
+                       'strip_vlan,resubmit(,{:d})'.format(
+                           port.ofport,
+                           ovsfw_consts.REG_PORT,
+                           port.vlan_tag,
+                           ovsfw_consts.REG_NET,
+                           ovs_consts.BASE_INGRESS_TABLE)}
+        ingress_flow_call1 = mock.call(**call_args2)
 
         call_args3 = {
             'table': ovs_consts.TRANSIENT_TABLE,
@@ -730,20 +629,9 @@ class TestOVSFirewallDriver(base.BaseTestCase):
                            port.vlan_tag,
                            ovsfw_consts.REG_NET,
                            ovs_consts.BASE_INGRESS_TABLE)}
-        expected_calls.append(mock.call(**call_args3))
-        self.mock_bridge.br.add_flow.assert_has_calls(expected_calls)
-
-    def test_initialize_port_flows_dvr_conntrack_direct_vxlan(self):
-        self._test_initialize_port_flows_dvr_conntrack_direct(
-                network_type='vxlan')
-
-    def test_initialize_port_flows_dvr_conntrack_direct_vlan(self):
-        self._test_initialize_port_flows_dvr_conntrack_direct(
-                network_type='vlan')
-
-    def test_initialize_port_flows_dvr_conntrack_direct_flat(self):
-        self._test_initialize_port_flows_dvr_conntrack_direct(
-                network_type='flat')
+        ingress_flow_call2 = mock.call(**call_args3)
+        self.mock_bridge.br.add_flow.assert_has_calls(
+            [egress_flow_call, ingress_flow_call1, ingress_flow_call2])
 
     def test_initialize_port_flows_vlan_dvr_conntrack_direct_vlan(self):
         port_dict = {
@@ -822,7 +710,6 @@ class TestOVSFirewallDriver(base.BaseTestCase):
         self.assertFalse(self.mock_bridge.br.delete_flows.called)
         self.firewall.prepare_port_filter(port_dict)
         self.assertTrue(self.mock_bridge.br.delete_flows.called)
-        self._assert_invalid_conntrack_entries_deleted(port_dict)
 
     def test_update_port_filter(self):
         port_dict = {'device': 'port-id',
@@ -854,7 +741,6 @@ class TestOVSFirewallDriver(base.BaseTestCase):
             table=ovs_consts.RULES_EGRESS_TABLE)]
         self.mock_bridge.br.add_flow.assert_has_calls(
             filter_rules, any_order=True)
-        self._assert_invalid_conntrack_entries_deleted(port_dict)
 
     def test_update_port_filter_create_new_port_if_not_present(self):
         port_dict = {'device': 'port-id',
@@ -874,18 +760,15 @@ class TestOVSFirewallDriver(base.BaseTestCase):
         self.assertFalse(self.mock_bridge.br.delete_flows.called)
         self.assertTrue(initialize_port_flows_mock.called)
         self.assertTrue(add_flows_from_rules_mock.called)
-        self._assert_invalid_conntrack_entries_deleted(port_dict)
 
     def test_update_port_filter_port_security_disabled(self):
         port_dict = {'device': 'port-id',
                      'security_groups': [1]}
         self._prepare_security_group()
         self.firewall.prepare_port_filter(port_dict)
-        self.delete_invalid_conntrack_entries_mock.reset_mock()
         port_dict['port_security_enabled'] = False
         self.firewall.update_port_filter(port_dict)
         self.assertTrue(self.mock_bridge.br.delete_flows.called)
-        self.delete_invalid_conntrack_entries_mock.assert_not_called()
 
     def test_update_port_filter_applies_added_flows(self):
         """Check flows are applied right after _set_flows is called."""
@@ -906,7 +789,6 @@ class TestOVSFirewallDriver(base.BaseTestCase):
         self.mock_bridge.br.get_vif_port_by_id.return_value = None
         self.firewall.update_port_filter(port_dict)
         self.assertTrue(self.mock_bridge.br.delete_flows.called)
-        self._assert_invalid_conntrack_entries_deleted(port_dict)
 
     def test_remove_port_filter(self):
         port_dict = {'device': 'port-id',
@@ -999,38 +881,6 @@ class TestOVSFirewallDriver(base.BaseTestCase):
         with testtools.ExpectedException(exceptions.OVSFWPortNotHandled):
             self.firewall._remove_egress_no_port_security('foo')
 
-    def test__initialize_egress_ipv6_icmp(self):
-        port_dict = {
-            'device': 'port-id',
-            'security_groups': [1],
-            'fixed_ips': ["10.0.0.1"],
-            'allowed_address_pairs': [
-                {'mac_address': 'aa:bb:cc:dd:ee:ff',
-                 'ip_address': '192.168.1.1'},
-                {'mac_address': 'aa:bb:cc:dd:ee:ff',
-                 'ip_address': '2003::1'}
-            ]}
-        of_port = create_ofport(port_dict)
-        self.mock_bridge.br.db_get_val.return_value = {'tag': TESTING_VLAN_TAG}
-        self.firewall._initialize_egress_ipv6_icmp(
-            of_port, set([('aa:bb:cc:dd:ee:ff', '2003::1')]))
-        expected_calls = []
-        for icmp_type in agent_firewall.ICMPV6_ALLOWED_EGRESS_TYPES:
-            expected_calls.append(
-                mock.call(
-                    table=ovs_consts.BASE_EGRESS_TABLE,
-                    priority=95,
-                    in_port=TESTING_VLAN_TAG,
-                    reg5=TESTING_VLAN_TAG,
-                    dl_type='0x86dd',
-                    nw_proto=constants.PROTO_NUM_IPV6_ICMP,
-                    icmp_type=icmp_type,
-                    dl_src='aa:bb:cc:dd:ee:ff',
-                    ipv6_src='2003::1',
-                    actions='resubmit(,%d)' % (
-                        ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE)))
-        self.mock_bridge.br.add_flow.assert_has_calls(expected_calls)
-
     def test_process_trusted_ports_caches_port_id(self):
         vif_port = ovs_lib.VifPort('name', 1, 'id', 'mac', mock.ANY)
         with mock.patch.object(self.firewall.int_br.br, 'get_vifs_by_ids',
@@ -1058,53 +908,6 @@ class TestOVSFirewallDriver(base.BaseTestCase):
     def test_remove_trusted_ports_not_managed_port(self):
         """Check that exception is not propagated outside."""
         self.firewall.remove_trusted_ports(['port_id'])
-
-    def _test_delete_flows_for_flow_state(self, addr_to_conj,
-                                          explicitly_egress_direct=True):
-        direction = 'one_direction'
-        ethertype = 'ethertype'
-        vlan_tag = 'taaag'
-        with mock.patch.object(self.firewall, 'delete_flow_for_ip') as \
-                mock_delete_flow_for_ip:
-            flow_state = {'addr1': {8, 16, 24}, 'addr2': {32, 40}}
-            cfg.CONF.set_override('explicitly_egress_direct',
-                                  explicitly_egress_direct, 'AGENT')
-            self.firewall.delete_flows_for_flow_state(
-                flow_state, addr_to_conj, direction, ethertype, vlan_tag)
-        calls = []
-        for removed_ip in set(flow_state.keys()) - set(addr_to_conj.keys()):
-            calls.append(mock.call(removed_ip, direction, ethertype, vlan_tag,
-                                   flow_state[removed_ip]))
-            if explicitly_egress_direct:
-                calls.append(mock.call(removed_ip, direction, ethertype,
-                                       vlan_tag, [0]))
-        mock_delete_flow_for_ip.assert_has_calls(calls)
-
-    def test_delete_flows_for_flow_state_no_removed_ips_exp_egress(self):
-        addr_to_conj = {'addr1': {8, 16, 24}, 'addr2': {32, 40}}
-        self._test_delete_flows_for_flow_state(addr_to_conj)
-
-    def test_delete_flows_for_flow_state_no_removed_ips_no_exp_egress(self):
-        addr_to_conj = {'addr1': {8, 16, 24}, 'addr2': {32, 40}}
-        self._test_delete_flows_for_flow_state(addr_to_conj, False)
-
-    def test_delete_flows_for_flow_state_removed_ips_exp_egress(self):
-        addr_to_conj = {'addr2': {32, 40}}
-        self._test_delete_flows_for_flow_state(addr_to_conj)
-
-    def test_delete_flows_for_flow_state_removed_ips_no_exp_egress(self):
-        addr_to_conj = {'addr1': {8, 16, 24}}
-        self._test_delete_flows_for_flow_state(addr_to_conj, False)
-
-    def test_delete_flow_for_ip_using_cookie_any(self):
-        with mock.patch.object(self.firewall, '_delete_flows') as \
-                mock_delete_flows:
-            self.firewall.delete_flow_for_ip('10.1.2.3',
-                                             constants.INGRESS_DIRECTION,
-                                             constants.IPv4, 100, [0])
-            _, kwargs = mock_delete_flows.call_args
-            self.assertIn('cookie', kwargs)
-            self.assertIs(ovs_lib.COOKIE_ANY, kwargs['cookie'])
 
 
 class TestCookieContext(base.BaseTestCase):

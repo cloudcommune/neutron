@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import glob
 import os
 import re
 
@@ -21,19 +20,12 @@ from neutron_lib.utils import helpers
 from oslo_log import log as logging
 
 from neutron._i18n import _
+from neutron.agent.linux import ip_link_support
 from neutron.plugins.ml2.drivers.mech_sriov.agent.common \
     import exceptions as exc
 from neutron.plugins.ml2.drivers.mech_sriov.agent import pci_lib
 
 LOG = logging.getLogger(__name__)
-
-
-IP_LINK_CAPABILITY_STATE = 'state'
-IP_LINK_CAPABILITY_VLAN = 'vlan'
-IP_LINK_CAPABILITY_RATE = 'max_tx_rate'
-IP_LINK_CAPABILITY_MIN_TX_RATE = 'min_tx_rate'
-IP_LINK_CAPABILITY_SPOOFCHK = 'spoofchk'
-IP_LINK_SUB_CAPABILITY_QOS = 'qos'
 
 
 class PciOsWrapper(object):
@@ -44,7 +36,6 @@ class PciOsWrapper(object):
     NUMVFS_PATH = "/sys/class/net/%s/device/sriov_numvfs"
     VIRTFN_FORMAT = r"^virtfn(?P<vf_index>\d+)"
     VIRTFN_REG_EX = re.compile(VIRTFN_FORMAT)
-    MAC_VTAP_PREFIX = "upper_macvtap*"
 
     @classmethod
     def scan_vf_devices(cls, dev_name):
@@ -76,46 +67,41 @@ class PciOsWrapper(object):
         return os.path.isdir(cls.DEVICE_PATH % dev_name)
 
     @classmethod
-    def is_assigned_vf_direct(cls, dev_name, vf_index):
+    def is_assigned_vf(cls, dev_name, vf_index, ip_link_show_output):
         """Check if VF is assigned.
 
         Checks if a given vf index of a given device name is assigned
-        as PCI passthrough by checking the relevant path in the system:
+        by checking the relevant path in the system:
         VF is assigned if:
             Direct VF: PCI_PATH does not exist.
+            Macvtap VF: macvtap@<vf interface> interface exists in ip link show
         @param dev_name: pf network device name
         @param vf_index: vf index
-        @return: True if VF is assigned, False otherwise
+        @param ip_link_show_output: 'ip link show' output
         """
+
+        if not cls.pf_device_exists(dev_name):
+            # If the root PCI path does not exist, then the VF cannot
+            # actually have been allocated and there is no way we can
+            # manage it.
+            return False
+
         path = cls.PCI_PATH % (dev_name, vf_index)
-        return not os.path.isdir(path)
 
-    @classmethod
-    def get_vf_macvtap_upper_devs(cls, dev_name, vf_index):
-        """Retrieve VF netdev upper (macvtap) devices.
+        try:
+            ifname_list = os.listdir(path)
+        except OSError:
+            # PCI_PATH does not exist means that the DIRECT VF assigned
+            return True
 
-        @param dev_name: pf network device name
-        @param vf_index: vf index
-        @return: list of upper net devices associated with the VF
-        """
-        path = cls.PCI_PATH % (dev_name, vf_index)
-        upper_macvtap_path = os.path.join(path, "*", cls.MAC_VTAP_PREFIX)
-        devs = [os.path.basename(dev) for dev in glob.glob(upper_macvtap_path)]
-        # file name is in the format of upper_<netdev_name> extract netdev name
-        return [dev.split('_')[1] for dev in devs]
-
-    @classmethod
-    def is_assigned_vf_macvtap(cls, dev_name, vf_index):
-        """Check if VF is assigned.
-
-        Checks if a given vf index of a given device name is assigned
-        as macvtap by checking the relevant path in the system:
-            Macvtap VF: upper_macvtap path exists.
-        @param dev_name: pf network device name
-        @param vf_index: vf index
-        @return: True if VF is assigned, False otherwise
-        """
-        return bool(cls.get_vf_macvtap_upper_devs(dev_name, vf_index))
+        # Note(moshele) kernel < 3.13 doesn't create symbolic link
+        # for macvtap interface. Therefore we workaround it
+        # by parsing ip link show and checking if macvtap interface exists
+        for ifname in ifname_list:
+            if pci_lib.PciDeviceIPWrapper.is_macvtap_assigned(
+                    ifname, ip_link_show_output):
+                return True
+        return False
 
     @classmethod
     def get_numvfs(cls, dev_name):
@@ -181,10 +167,18 @@ class EmbSwitch(object):
 
         @return: list of VF pair (mac address, pci slot)
         """
+        vf_to_pci_slot_mapping = {}
         assigned_devices_info = []
+        ls = self.pci_dev_wrapper.link_show()
         for pci_slot, vf_index in self.pci_slot_map.items():
-            mac = self.get_pci_device(pci_slot)
-            if mac:
+            if not PciOsWrapper.is_assigned_vf(self.dev_name, vf_index, ls):
+                continue
+            vf_to_pci_slot_mapping[vf_index] = pci_slot
+        if vf_to_pci_slot_mapping:
+            vf_to_mac_mapping = self.pci_dev_wrapper.get_assigned_macs(
+                list(vf_to_pci_slot_mapping.keys()))
+            for vf_index, mac in vf_to_mac_mapping.items():
+                pci_slot = vf_to_pci_slot_mapping[vf_index]
                 assigned_devices_info.append((mac, pci_slot))
         return assigned_devices_info
 
@@ -207,11 +201,11 @@ class EmbSwitch(object):
                                                  auto=propagate_uplink_state)
 
     def set_device_rate(self, pci_slot, rate_type, rate_kbps):
-        """Set device rate: max_tx_rate, min_tx_rate
+        """Set device rate: rate (max_tx_rate), min_tx_rate
 
         @param pci_slot: Virtual Function address
-        @param rate_type: device rate name type. Could be 'max_tx_rate' and
-                          'min_tx_rate' ('rate' is not supported anymore).
+        @param rate_type: device rate name type. Could be 'rate' and
+                          'min_tx_rate'.
         @param rate_kbps: device rate in kbps
         """
         vf_index = self._get_vf_index(pci_slot)
@@ -260,45 +254,19 @@ class EmbSwitch(object):
             raise exc.InvalidPciSlotError(pci_slot=pci_slot)
         return self.pci_dev_wrapper.set_vf_spoofcheck(vf_index, enabled)
 
-    def _get_macvtap_mac(self, vf_index):
-        upperdevs = PciOsWrapper.get_vf_macvtap_upper_devs(
-            self.dev_name, vf_index)
-        # NOTE(adrianc) although there can be many macvtap upper
-        # devices, we expect to have excatly one.
-        if len(upperdevs) > 1:
-            LOG.warning("Found more than one macvtap upper device for PF "
-                        "%(pf)s with VF index %(vf_index)s.",
-                        {"pf": self.dev_name, "vf_index": vf_index})
-        upperdev = upperdevs[0]
-        return pci_lib.PciDeviceIPWrapper(
-            upperdev).device(upperdev).link.address
-
     def get_pci_device(self, pci_slot):
         """Get mac address for given Virtual Function address
 
         @param pci_slot: pci slot
         @return: MAC address of virtual function
         """
-        if not PciOsWrapper.pf_device_exists(self.dev_name):
-            # If the root PCI path does not exist, then the VF cannot
-            # actually have been allocated and there is no way we can
-            # manage it.
-            return None
-
         vf_index = self.pci_slot_map.get(pci_slot)
         mac = None
-
         if vf_index is not None:
-            # NOTE(adrianc) for VF passthrough take administrative mac from PF
-            # netdevice, for macvtap take mac directly from macvtap interface.
-            # This is done to avoid relying on hypervisor [lack of] logic to
-            # keep effective and administrative mac in sync.
-            if PciOsWrapper.is_assigned_vf_direct(self.dev_name, vf_index):
+            ls = self.pci_dev_wrapper.link_show()
+            if PciOsWrapper.is_assigned_vf(self.dev_name, vf_index, ls):
                 macs = self.pci_dev_wrapper.get_assigned_macs([vf_index])
                 mac = macs.get(vf_index)
-            elif PciOsWrapper.is_assigned_vf_macvtap(
-                    self.dev_name, vf_index):
-                mac = self._get_macvtap_mac(vf_index)
         return mac
 
 
@@ -356,7 +324,7 @@ class ESwitchManager(object):
         embedded_switch = self._get_emb_eswitch(device_mac, pci_slot)
         if embedded_switch:
             return embedded_switch.get_device_state(pci_slot)
-        return pci_lib.LinkState.disable.name
+        return pci_lib.LinkState.DISABLE
 
     def set_device_max_rate(self, device_mac, pci_slot, max_kbps):
         """Set device max rate
@@ -369,7 +337,9 @@ class ESwitchManager(object):
         embedded_switch = self._get_emb_eswitch(device_mac, pci_slot)
         if embedded_switch:
             embedded_switch.set_device_rate(
-                pci_slot, IP_LINK_CAPABILITY_RATE, max_kbps)
+                pci_slot,
+                ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_RATE,
+                max_kbps)
 
     def set_device_min_tx_rate(self, device_mac, pci_slot, min_kbps):
         """Set device min_tx_rate
@@ -382,7 +352,9 @@ class ESwitchManager(object):
         embedded_switch = self._get_emb_eswitch(device_mac, pci_slot)
         if embedded_switch:
             embedded_switch.set_device_rate(
-                pci_slot, IP_LINK_CAPABILITY_MIN_TX_RATE, min_kbps)
+                pci_slot,
+                ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_MIN_TX_RATE,
+                min_kbps)
 
     def set_device_state(self, device_mac, pci_slot, admin_state_up,
                          propagate_uplink_state):
@@ -501,7 +473,9 @@ class ESwitchManager(object):
         Clear the "rate" configuration from VF by setting it to 0.
         @param pci_slot: VF PCI slot
         """
-        self._clear_rate(pci_slot, IP_LINK_CAPABILITY_RATE)
+        self._clear_rate(
+            pci_slot,
+            ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_RATE)
 
     def clear_min_tx_rate(self, pci_slot):
         """Clear the VF "min_tx_rate" parameter
@@ -509,14 +483,16 @@ class ESwitchManager(object):
         Clear the "min_tx_rate" configuration from VF by setting it to 0.
         @param pci_slot: VF PCI slot
         """
-        self._clear_rate(pci_slot, IP_LINK_CAPABILITY_MIN_TX_RATE)
+        self._clear_rate(
+            pci_slot,
+            ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_MIN_TX_RATE)
 
     def _clear_rate(self, pci_slot, rate_type):
         """Clear the VF rate parameter specified in rate_type
 
         Clear the rate configuration from VF by setting it to 0.
         @param pci_slot: VF PCI slot
-        @param rate_type: rate to clear ('max_tx_rate', 'min_tx_rate')
+        @param rate_type: rate to clear ('rate', 'min_tx_rate')
         """
         # NOTE(Moshe Levi): we don't use the self._get_emb_eswitch here,
         # because when clearing the VF it may be not assigned. This happens

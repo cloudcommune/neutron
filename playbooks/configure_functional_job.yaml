@@ -1,5 +1,4 @@
 - hosts: all
   roles:
-    - ensure-tox
     - setup_logdir
     - configure_functional_tests

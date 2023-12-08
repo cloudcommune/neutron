@@ -1074,16 +1074,22 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         need_network_update_notify = False
 
         with db_api.CONTEXT_WRITER.using(context):
-            db_network = self._get_network(context, id)
-            original_network = self.get_network(context, id, net_db=db_network)
+            original_network = self.get_network(context, id)
             self._update_provider_network_attributes(
                 context, original_network, net_data)
 
-            updated_network = super(Ml2Plugin, self).update_network(
-                context, id, network, db_network=db_network)
+            updated_network = super(Ml2Plugin, self).update_network(context,
+                                                                    id,
+                                                                    network)
             self.extension_manager.process_update_network(context, net_data,
                                                           updated_network)
             self._process_l3_update(context, updated_network, net_data)
+
+            # ToDO(QoS): This would change once EngineFacade moves out
+            db_network = self._get_network(context, id)
+            # Expire the db_network in current transaction, so that the join
+            # relationship can be updated.
+            context.session.expire(db_network)
 
             if (mtuw_apidef.MTU in net_data or
                 # NOTE(ihrachys) mtu may be null for existing networks,
@@ -1131,11 +1137,11 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         return updated_network
 
     @db_api.retry_if_session_inactive()
-    def get_network(self, context, id, fields=None, net_db=None):
+    def get_network(self, context, id, fields=None):
         # NOTE(ihrachys) use writer manager to be able to update mtu
         # TODO(ihrachys) remove in Queens+ when mtu is not nullable
         with db_api.CONTEXT_WRITER.using(context):
-            net_db = net_db or self._get_network(context, id)
+            net_db = self._get_network(context, id)
 
             # NOTE(ihrachys) pre Pike networks may have null mtus; update them
             # in database if needed
@@ -1200,8 +1206,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                        priority=0)
     def _network_delete_precommit_handler(self, rtype, event, trigger,
                                           context, network_id, **kwargs):
-        network = (kwargs.get('network') or
-                   self.get_network(context, network_id))
+        network = self.get_network(context, network_id)
         mech_context = driver_context.NetworkContext(self,
                                                      context,
                                                      network)
@@ -1262,8 +1267,6 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         # db base plugin post commit ops
         self._create_subnet_postcommit(context, result)
 
-        # add network to subnet dict to save a DB call on dhcp notification
-        result['network'] = mech_context.network.current
         kwargs = {'context': context, 'subnet': result}
         registry.notify(resources.SUBNET, events.AFTER_CREATE, self, **kwargs)
         try:
@@ -1382,6 +1385,9 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
 
         registry.notify(resources.PORT, events.BEFORE_CREATE, self,
                         context=context, port=attrs)
+        # NOTE(kevinbenton): triggered outside of transaction since it
+        # emits 'AFTER' events if it creates.
+        self._ensure_default_security_group(context, attrs['tenant_id'])
 
     def _create_port_db(self, context, port):
         attrs = port[port_def.RESOURCE_NAME]
@@ -1424,8 +1430,6 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         return self._after_create_port(context, result, mech_context)
 
     def _after_create_port(self, context, result, mech_context):
-        # add network to port dict to save a DB call on dhcp notification
-        result['network'] = mech_context.network.current
         # notify any plugin that is interested in port create events
         kwargs = {'context': context, 'port': result}
         registry.notify(resources.PORT, events.AFTER_CREATE, self, **kwargs)
@@ -1552,7 +1556,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                 port_compat = {'port': port_dict}
 
                 # Activities immediately post-port-creation
-                self.extension_manager.process_create_port(context, pdata,
+                self.extension_manager.process_create_port(context, port_dict,
                                                            db_port_obj)
                 self._portsec_ext_port_create_processing(context, port_dict,
                                                          port_compat)
@@ -1684,8 +1688,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
             need_port_update_notify |= mac_address_updated
             original_port = self._make_port_dict(port_db)
             updated_port = super(Ml2Plugin, self).update_port(context, id,
-                                                              port,
-                                                              db_port=port_db)
+                                                              port)
             self.extension_manager.process_update_port(context, attrs,
                                                        updated_port)
             self._portsec_ext_port_update_processing(updated_port, context,
@@ -2305,14 +2308,12 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         # TODO(boden); refactor into _handle_segment_change once all
         # event types use payloads
         return self._handle_segment_change(
-            rtype, event, trigger, payload.context, payload.latest_state,
-            for_net_delete=payload.metadata.get('for_net_delete'))
+            rtype, event, trigger, payload.context, payload.latest_state)
 
     @registry.receives(resources.SEGMENT, (events.PRECOMMIT_CREATE,
                                            events.PRECOMMIT_DELETE,
                                            events.AFTER_CREATE))
-    def _handle_segment_change(self, rtype, event, trigger, context, segment,
-                               for_net_delete=False):
+    def _handle_segment_change(self, rtype, event, trigger, context, segment):
         if (event == events.PRECOMMIT_CREATE and
                 not isinstance(trigger, segments_plugin.Plugin)):
             # TODO(xiaohhui): Now, when create network, ml2 will reserve
@@ -2332,9 +2333,6 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
             segment[api.SEGMENTATION_ID] = updated_segment[api.SEGMENTATION_ID]
         elif event == events.PRECOMMIT_DELETE:
             self.type_manager.release_network_segment(context, segment)
-
-        if for_net_delete:
-            return
 
         # change in segments could affect resulting network mtu, so let's
         # recalculate it

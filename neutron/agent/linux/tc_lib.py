@@ -82,6 +82,10 @@ class InvalidUnit(exceptions.NeutronException):
     message = _("Unit name '%(unit)s' is not valid.")
 
 
+class TcLibPolicyClassInvalidMinKbpsValue(exceptions.NeutronException):
+    message = _("'min_kbps' is mandatory in a TC class and must be >= 1.")
+
+
 def convert_to_kilobits(value, base):
     value = value.lower()
     if "bit" in value:
@@ -145,21 +149,6 @@ def _calc_burst(rate, buffer):
     return int(math.ceil(
         float(buffer * rate) /
         (rtnl_common.TIME_UNITS_PER_SEC * rtnl_common.tick_in_usec)))
-
-
-def _calc_min_rate(burst):
-    """Calculate minimum rate (bytes per second) accepted by Pyroute2
-
-    When creating a TC policy class, this function calculates the minimum
-    rate (bytes/sec) accepted by Pyroute2. This method is based on
-    pyroute2.netlink.rtnl.tcmsg.common.calc_xmittime
-
-    :param rate: (int) rate in bytes per second.
-    :param burst: (int) burst in bytes.
-    :return: (int) minimum accepted rate in bytes per second.
-    """
-    return max(8, math.ceil((rtnl_common.TIME_UNITS_PER_SEC *
-                             rtnl_common.tick_in_usec * burst) / 2**32))
 
 
 def _calc_latency_ms(limit, burst, rate):
@@ -345,8 +334,8 @@ def add_tc_qdisc(device, qdisc_type, parent=None, handle=None, latency_ms=None,
                 qdisc_type=qdisc_type,
                 needed_arguments=['latency_ms', 'max_kbps', 'kernel_hz'])
         args['burst'] = int(
-            _get_tbf_burst_value(max_kbps, burst_kb, kernel_hz) * 1000 / 8)
-        args['rate'] = int(max_kbps * 1000 / 8)
+            _get_tbf_burst_value(max_kbps, burst_kb, kernel_hz) * 1024 / 8)
+        args['rate'] = int(max_kbps * 1024 / 8)
         args['latency'] = latency_ms * 1000
     if parent:
         args['parent'] = rtnl.TC_H_ROOT if parent == 'root' else parent
@@ -371,10 +360,10 @@ def list_tc_qdiscs(device, namespace=None):
         if qdisc_attrs['qdisc_type'] == 'tbf':
             tca_options = _get_attr(qdisc, 'TCA_OPTIONS')
             tca_tbf_parms = _get_attr(tca_options, 'TCA_TBF_PARMS')
-            qdisc_attrs['max_kbps'] = int(tca_tbf_parms['rate'] * 8 / 1000)
+            qdisc_attrs['max_kbps'] = int(tca_tbf_parms['rate'] * 8 / 1024)
             burst_bytes = _calc_burst(tca_tbf_parms['rate'],
                                       tca_tbf_parms['buffer'])
-            qdisc_attrs['burst_kb'] = int(burst_bytes * 8 / 1000)
+            qdisc_attrs['burst_kb'] = int(burst_bytes * 8 / 1024)
             qdisc_attrs['latency_ms'] = _calc_latency_ms(
                 tca_tbf_parms['limit'], burst_bytes, tca_tbf_parms['rate'])
         retval.append(qdisc_attrs)
@@ -405,45 +394,34 @@ def delete_tc_qdisc(device, parent=None, is_ingress=False,
         raise_qdisc_not_found=raise_qdisc_not_found, namespace=namespace)
 
 
-def add_tc_policy_class(device, parent, classid, max_kbps, min_kbps=None,
+def add_tc_policy_class(device, parent, classid, min_kbps=1, max_kbps=None,
                         burst_kb=None, namespace=None):
     """Add a TC policy class
 
     :param device: (string) device name
     :param parent: (string) qdisc parent class ('root', 'ingress', '2:10')
     :param classid: (string) major:minor handler identifier ('10:20')
-    :param max_kbps: (int) maximum bandwidth in kbps
     :param min_kbps: (int) (optional) minimum bandwidth in kbps
+    :param max_kbps: (int) (optional) maximum bandwidth in kbps
     :param burst_kb: (int) (optional) burst size in kb
     :param namespace: (string) (optional) namespace name
     :return:
     """
     parent = TC_QDISC_PARENT.get(parent, parent)
-    if not burst_kb:
-        burst_kb = max_kbps * qos_consts.DEFAULT_BURST_RATE
-
     # NOTE(ralonsoh): pyroute2 input parameters and units [1]:
     #   - rate (min bw): bytes/second
     #   - ceil (max bw): bytes/second
     #   - burst: bytes
     # [1] https://www.systutorials.com/docs/linux/man/8-tc/
-    kwargs = {'ceil': int(max_kbps * 1000 / 8),
-              'burst': int(burst_kb * 1000 / 8)}
-
-    rate = int((min_kbps or 0) * 1000 / 8)
-    min_rate = _calc_min_rate(kwargs['burst'])
-    if min_rate > rate:
-        LOG.warning('TC HTB class policy rate %(rate)s (bytes/second) is '
-                    'lower than the minimum accepted %(min_rate)s '
-                    '(bytes/second), for device %(device)s, qdisc '
-                    '%(qdisc)s and classid %(classid)s',
-                    {'rate': rate, 'min_rate': min_rate, 'device': device,
-                     'qdisc': parent, 'classid': classid})
-        rate = min_rate
-    kwargs['rate'] = rate
-
+    if int(min_kbps) < 1:
+        raise TcLibPolicyClassInvalidMinKbpsValue()
+    args = {'rate': int(min_kbps * 1024 / 8)}
+    if max_kbps:
+        args['ceil'] = int(max_kbps * 1024 / 8)
+    if burst_kb:
+        args['burst'] = int(burst_kb * 1024 / 8)
     priv_tc_lib.add_tc_policy_class(device, parent, classid, 'htb',
-                                    namespace=namespace, **kwargs)
+                                    namespace=namespace, **args)
 
 
 def list_tc_policy_class(device, namespace=None):
@@ -460,9 +438,9 @@ def list_tc_policy_class(device, namespace=None):
         tca_params = _get_attr(tca_options,
                                'TCA_' + qdisc_type.upper() + '_PARMS')
         burst_kb = int(
-            _calc_burst(tca_params['rate'], tca_params['buffer']) * 8 / 1000)
-        max_kbps = int(tca_params['ceil'] * 8 / 1000)
-        min_kbps = int(tca_params['rate'] * 8 / 1000)
+            _calc_burst(tca_params['rate'], tca_params['buffer']) * 8 / 1024)
+        max_kbps = int(tca_params['ceil'] * 8 / 1024)
+        min_kbps = int(tca_params['rate'] * 8 / 1024)
         return max_kbps, min_kbps, burst_kb
 
     tc_classes = priv_tc_lib.list_tc_policy_classes(device,
@@ -562,8 +540,8 @@ def add_tc_filter_policy(device, parent, rate_kbps, burst_kb, mtu, action,
     :param namespace: (string) (optional) namespace name
 
     """
-    rate = int(rate_kbps * 1000 / 8)
-    burst = int(burst_kb * 1000 / 8)
+    rate = int(rate_kbps * 1024 / 8)
+    burst = int(burst_kb * 1024 / 8)
     priv_tc_lib.add_tc_filter_policy(device, parent, priority, rate, burst,
                                      mtu, action, protocol=protocol,
                                      namespace=namespace)
@@ -604,10 +582,10 @@ def list_tc_filters(device, parent, namespace=None):
         if tca_u32_police:
             tca_police_tbf = _get_attr(tca_u32_police, 'TCA_POLICE_TBF')
             if tca_police_tbf:
-                value['rate_kbps'] = int(tca_police_tbf['rate'] * 8 / 1000)
+                value['rate_kbps'] = int(tca_police_tbf['rate'] * 8 / 1024)
                 value['burst_kb'] = int(
                     _calc_burst(tca_police_tbf['rate'],
-                                tca_police_tbf['burst']) * 8 / 1000)
+                                tca_police_tbf['burst']) * 8 / 1024)
                 value['mtu'] = tca_police_tbf['mtu']
 
         retval.append(value)

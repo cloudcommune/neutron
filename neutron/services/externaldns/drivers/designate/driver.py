@@ -23,7 +23,6 @@ from keystoneauth1 import token_endpoint
 from neutron_lib import constants
 from neutron_lib.exceptions import dns as dns_exc
 from oslo_config import cfg
-from oslo_log import log
 
 from neutron.conf.services import extdns_designate_driver
 from neutron.services.externaldns import driver
@@ -37,8 +36,6 @@ _SESSION = None
 
 CONF = cfg.CONF
 extdns_designate_driver.register_designate_opts()
-
-LOG = log.getLogger(__name__)
 
 
 def get_clients(context):
@@ -62,11 +59,6 @@ def get_clients(context):
             tenant_id=CONF.designate.admin_tenant_id)
     admin_client = d_client.Client(session=_SESSION, auth=admin_auth)
     return client, admin_client
-
-
-def get_all_projects_client(context):
-    auth = token_endpoint.Token(CONF.designate.url, context.auth_token)
-    return d_client.Client(session=_SESSION, auth=auth, all_projects=True)
 
 
 class Designate(driver.ExternalDNSService):
@@ -125,21 +117,9 @@ class Designate(driver.ExternalDNSService):
                                                   in_addr_name, 'PTR',
                                                   [recordset_name])
             except d_exc.NotFound:
-                # Note(jh): If multiple PTRs get created at the same time,
-                # the creation of the zone may fail with a conflict because
-                # it has already been created by a parallel job. So we
-                # ignore that error and try to create the recordset
-                # anyway. That call will still fail in the end if something
-                # is really broken. See bug 1891309.
-                try:
-                    designate_admin.zones.create(
-                        in_addr_zone_name, email=ptr_zone_email,
-                        description=in_addr_zone_description)
-                except d_exc.Conflict:
-                    LOG.debug('Conflict when trying to create PTR zone %s,'
-                              ' assuming it exists.',
-                              in_addr_zone_name)
-                    pass
+                designate_admin.zones.create(
+                    in_addr_zone_name, email=ptr_zone_email,
+                    description=in_addr_zone_description)
                 designate_admin.recordsets.create(in_addr_zone_name,
                                                   in_addr_name, 'PTR',
                                                   [recordset_name])
@@ -166,25 +146,18 @@ class Designate(driver.ExternalDNSService):
                     CONF.designate.ipv6_ptr_zone_prefix_size) / 4)
 
     def delete_record_set(self, context, dns_domain, dns_name, records):
-        client, admin_client = get_clients(context)
-        try:
-            ids_to_delete = self._get_ids_ips_to_delete(
-                dns_domain, '%s.%s' % (dns_name, dns_domain), records, client)
-        except dns_exc.DNSDomainNotFound:
-            # Try whether we have admin powers and can see all projects
-            client = get_all_projects_client(context)
-            ids_to_delete = self._get_ids_ips_to_delete(
-                dns_domain, '%s.%s' % (dns_name, dns_domain), records, client)
-
+        designate, designate_admin = get_clients(context)
+        ids_to_delete = self._get_ids_ips_to_delete(
+            dns_domain, '%s.%s' % (dns_name, dns_domain), records, designate)
         for _id in ids_to_delete:
-            client.recordsets.delete(dns_domain, _id)
+            designate.recordsets.delete(dns_domain, _id)
         if not CONF.designate.allow_reverse_dns_lookup:
             return
 
         for record in records:
             in_addr_name = netaddr.IPAddress(record).reverse_dns
             in_addr_zone_name = self._get_in_addr_zone_name(in_addr_name)
-            admin_client.recordsets.delete(in_addr_zone_name, in_addr_name)
+            designate_admin.recordsets.delete(in_addr_zone_name, in_addr_name)
 
     def _get_ids_ips_to_delete(self, dns_domain, name, records,
                                designate_client):

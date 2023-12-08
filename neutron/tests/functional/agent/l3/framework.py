@@ -15,7 +15,7 @@
 
 import copy
 import functools
-import os
+import textwrap
 
 import mock
 import netaddr
@@ -37,7 +37,6 @@ from neutron.agent.linux import keepalived
 from neutron.agent.metadata import driver as metadata_driver
 from neutron.common import utils as common_utils
 from neutron.conf.agent import common as agent_config
-from neutron.conf.agent.l3 import config as l3_config
 from neutron.conf import common as common_config
 from neutron.tests.common import l3_test_common
 from neutron.tests.common import net_helpers
@@ -47,39 +46,6 @@ from neutron.tests.functional import base
 _uuid = uuidutils.generate_uuid
 
 OVS_INTERFACE_DRIVER = 'neutron.agent.linux.interface.OVSInterfaceDriver'
-
-KEEPALIVED_CONFIG = """\
-global_defs {
-    notification_email_from %(email_from)s
-    router_id %(router_id)s
-}
-vrrp_instance VR_1 {
-    state BACKUP
-    interface %(ha_device_name)s
-    virtual_router_id 1
-    priority 50
-    garp_master_delay 60
-    nopreempt
-    advert_int 2
-    track_interface {
-        %(ha_device_name)s
-    }
-    virtual_ipaddress {
-        169.254.0.1/24 dev %(ha_device_name)s
-    }
-    virtual_ipaddress_excluded {
-        %(floating_ip_cidr)s dev %(ex_device_name)s no_track
-        %(external_device_cidr)s dev %(ex_device_name)s no_track
-        %(internal_device_cidr)s dev %(internal_device_name)s no_track
-        %(ex_port_ipv6)s dev %(ex_device_name)s scope link no_track
-        %(int_port_ipv6)s dev %(internal_device_name)s scope link no_track
-    }
-    virtual_routes {
-        0.0.0.0/0 via %(default_gateway_ip)s dev %(ex_device_name)s no_track
-        8.8.8.0/24 via 19.4.4.4 no_track
-        %(extra_subnet_cidr)s dev %(ex_device_name)s scope link no_track
-    }
-}"""
 
 
 def get_ovs_bridge(br_name):
@@ -95,7 +61,6 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         self.mock_plugin_api = mock.patch(
             'neutron.agent.l3.agent.L3PluginApi').start().return_value
         mock.patch('neutron.agent.rpc.PluginReportStateAPI').start()
-        l3_config.register_l3_agent_config_opts(l3_config.OPTS, cfg.CONF)
         self.conf = self._configure_agent('agent1')
         self.agent = neutron_l3_agent.L3NATAgentWithStateReport('agent1',
                                                                 self.conf)
@@ -436,15 +401,12 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
     def _namespace_exists(self, namespace):
         return ip_lib.network_namespace_exists(namespace)
 
-    def _metadata_proxy(self, conf, router):
-        return external_process.ProcessManager(
+    def _metadata_proxy_exists(self, conf, router):
+        pm = external_process.ProcessManager(
             conf,
             router.router_id,
             router.ns_name,
             service=metadata_driver.HAPROXY_SERVICE)
-
-    def _metadata_proxy_exists(self, conf, router):
-        pm = self._metadata_proxy(conf, router)
         return pm.active
 
     def device_exists_with_ips_and_mac(self, expected_device, name_getter,
@@ -480,7 +442,38 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
             router.get_floating_ips()[0]['floating_ip_address'])
         default_gateway_ip = external_port['subnets'][0].get('gateway_ip')
         extra_subnet_cidr = external_port['extra_subnets'][0].get('cidr')
-        return KEEPALIVED_CONFIG % {
+        return textwrap.dedent("""\
+            global_defs {
+                notification_email_from %(email_from)s
+                router_id %(router_id)s
+            }
+            vrrp_instance VR_1 {
+                state BACKUP
+                interface %(ha_device_name)s
+                virtual_router_id 1
+                priority 50
+                garp_master_delay 60
+                nopreempt
+                advert_int 2
+                track_interface {
+                    %(ha_device_name)s
+                }
+                virtual_ipaddress {
+                    169.254.0.1/24 dev %(ha_device_name)s
+                }
+                virtual_ipaddress_excluded {
+                    %(floating_ip_cidr)s dev %(ex_device_name)s
+                    %(external_device_cidr)s dev %(ex_device_name)s
+                    %(internal_device_cidr)s dev %(internal_device_name)s
+                    %(ex_port_ipv6)s dev %(ex_device_name)s scope link
+                    %(int_port_ipv6)s dev %(internal_device_name)s scope link
+                }
+                virtual_routes {
+                    0.0.0.0/0 via %(default_gateway_ip)s dev %(ex_device_name)s
+                    8.8.8.0/24 via 19.4.4.4
+                    %(extra_subnet_cidr)s dev %(ex_device_name)s scope link
+                }
+            }""") % {
             'email_from': keepalived.KEEPALIVED_EMAIL_FROM,
             'router_id': keepalived.KEEPALIVED_ROUTER_ID,
             'ha_device_name': ha_device_name,
@@ -505,19 +498,9 @@ class L3AgentTestFramework(base.BaseSudoTestCase):
         # then the devices and iptable rules have also been deleted,
         # so there's no need to check that explicitly.
         self.assertFalse(self._namespace_exists(router.ns_name))
-        try:
-            common_utils.wait_until_true(
-                lambda: not self._metadata_proxy_exists(self.agent.conf,
-                                                        router),
-                timeout=10)
-        except common_utils.WaitTimeout:
-            pm = self._metadata_proxy(self.agent.conf, router)
-            pid_file = pm.get_pid_file_name()
-            if os.path.exists(pid_file):
-                msg = 'PID file %s still exists and it should not.' % pid_file
-            else:
-                msg = 'PID file %s is not present.' % pid_file
-            self.fail(msg)
+        common_utils.wait_until_true(
+            lambda: not self._metadata_proxy_exists(self.agent.conf, router),
+            timeout=10)
 
     def _assert_snat_chains(self, router):
         self.assertFalse(router.iptables_manager.is_chain_empty(

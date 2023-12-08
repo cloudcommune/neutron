@@ -36,13 +36,10 @@ from neutron.agent.common import ovs_lib
 from neutron.agent.common import polling
 from neutron.agent.common import utils
 from neutron.agent.linux import ip_lib
-from neutron.api.rpc.callbacks import resources
 from neutron.objects.ports import Port
 from neutron.objects.ports import PortBinding
 from neutron.plugins.ml2.drivers.l2pop import rpc as l2pop_rpc
 from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
-from neutron.plugins.ml2.drivers.openvswitch.agent \
-    import ovs_dvr_neutron_agent
 from neutron.plugins.ml2.drivers.openvswitch.agent import ovs_neutron_agent \
     as ovs_agent
 from neutron.tests import base
@@ -67,8 +64,6 @@ TEST_PORT_ID3 = 'port-id-3'
 
 TEST_NETWORK_ID1 = 'net-id-1'
 TEST_NETWORK_ID2 = 'net-id-2'
-
-TEST_MTU = 7824
 
 DEVICE_OWNER_COMPUTE = n_const.DEVICE_OWNER_COMPUTE_PREFIX + 'fake'
 
@@ -420,23 +415,24 @@ class TestOvsNeutronAgent(object):
     def test_scan_ports_returns_current_only_for_unchanged_ports(self):
         vif_port_set = set([1, 3])
         registered_ports = set([1, 3])
-        expected = ovs_agent.PortInfo(current=vif_port_set)
+        expected = {'current': vif_port_set,
+                    'added': set(),
+                    'removed': set()}
         actual = self.mock_scan_ports(vif_port_set, registered_ports)
         self.assertEqual(expected, actual)
 
     def test_scan_ports_returns_port_changes(self):
         vif_port_set = set([1, 3])
         registered_ports = set([1, 2])
-        expected = ovs_agent.PortInfo(current=vif_port_set, added=set([3]),
-                                      removed=set([2]))
+        expected = dict(current=vif_port_set, added=set([3]), removed=set([2]))
         actual = self.mock_scan_ports(vif_port_set, registered_ports)
         self.assertEqual(expected, actual)
 
     def test_scan_ports_returns_port_changes_with_sync(self):
         vif_port_set = set([1, 3])
         registered_ports = set([1, 2])
-        expected = ovs_agent.PortInfo(current=vif_port_set, added=vif_port_set,
-                                      removed=set([2]))
+        expected = dict(current=vif_port_set, added=vif_port_set,
+                        removed=set([2]))
         actual = self.mock_scan_ports(vif_port_set, registered_ports,
                                       sync=True)
         self.assertEqual(expected, actual)
@@ -444,8 +440,8 @@ class TestOvsNeutronAgent(object):
     def _test_scan_ports_with_updated_ports(self, updated_ports):
         vif_port_set = set([1, 3, 4])
         registered_ports = set([1, 2, 4])
-        expected = ovs_agent.PortInfo(current=vif_port_set, added={3},
-                                      removed={2}, updated={4})
+        expected = dict(current=vif_port_set, added=set([3]),
+                        removed=set([2]), updated=set([4]))
         actual = self.mock_scan_ports(vif_port_set, registered_ports,
                                       updated_ports)
         self.assertEqual(expected, actual)
@@ -462,8 +458,8 @@ class TestOvsNeutronAgent(object):
         vif_port_set = set([1, 3])
         registered_ports = set([1, 2])
         updated_ports = set([1, 2])
-        expected = ovs_agent.PortInfo(current=vif_port_set, added=set([3]),
-                                      removed=set([2]), updated=set([1]))
+        expected = dict(current=vif_port_set, added=set([3]),
+                        removed=set([2]), updated=set([1]))
         actual = self.mock_scan_ports(vif_port_set, registered_ports,
                                       updated_ports)
         self.assertEqual(expected, actual)
@@ -472,7 +468,8 @@ class TestOvsNeutronAgent(object):
         vif_port_set = set([1, 2, 3])
         registered_ports = set([1, 2, 3])
         updated_ports = set([2])
-        expected = ovs_agent.PortInfo(current=vif_port_set, updated=set([2]))
+        expected = dict(current=vif_port_set, updated=set([2]),
+                        added=set(), removed=set())
         actual = self.mock_scan_ports(vif_port_set, registered_ports,
                                       updated_ports)
         self.assertEqual(expected, actual)
@@ -496,38 +493,26 @@ class TestOvsNeutronAgent(object):
                 actual)
 
     def test_process_ports_events_port_removed_and_added(self):
-        port_id_one = 'f6f104bd-37c7-4f7b-9d70-53a6bb42728f'
-        port_id_two = 'fbaf42ef-ab63-4cda-81d2-37ee55daac3a'
+        port_id = 'f6f104bd-37c7-4f7b-9d70-53a6bb42728f'
         events = {
             'removed':
                 [{'ofport': 1,
-                  'external_ids': {'iface-id': port_id_one,
+                  'external_ids': {'iface-id': port_id,
                                    'attached-mac': 'fa:16:3e:f6:1b:fb'},
-                  'name': 'qvof6f104bd-37'},
-                 {'ofport': 2,
-                  'external_ids': {'iface-id': port_id_two,
-                                   'attached-mac': 'fa:16:3e:a4:42:6e'},
-                  'name': 'qvofbaf42ef-ab'}],
+                  'name': 'qvof6f104bd-37'}],
             'added':
-                [{'ofport': 3,
-                  'external_ids': {'iface-id': port_id_one,
+                [{'ofport': 2,
+                  'external_ids': {'iface-id': port_id,
                                    'attached-mac': 'fa:16:3e:f6:1b:fb'},
-                  'name': 'qvof6f104bd-37'},
-                 {'ofport': 4,
-                  'external_ids': {'iface-id': port_id_two,
-                                   'attached-mac': 'fa:16:3e:a4:42:6e'},
-                  'name': 'qvofbaf42ef-ab'}],
-            'modified': []
+                  'name': 'qvof6f104bd-37'}]
         }
-        registered_ports = {port_id_one, port_id_two}
-        expected_ancillary = ovs_agent.PortInfo()
+        registered_ports = {port_id}
+        expected_ancillary = dict(current=set(), added=set(), removed=set())
 
         # port was removed and then added
-        expected_ports = ovs_agent.PortInfo(
-            added={port_id_one, port_id_two},
-            current={port_id_one, port_id_two},
-            re_added={port_id_one, port_id_two}
-        )
+        expected_ports = dict(current={port_id},
+                              added={port_id},
+                              removed=set())
         with mock.patch.object(ovs_lib.BaseOVS, "port_exists",
                                return_value=True):
             self._test_process_ports_events(events.copy(), registered_ports,
@@ -535,7 +520,9 @@ class TestOvsNeutronAgent(object):
                                             expected_ancillary)
 
         # port was added and then removed
-        expected_ports = ovs_agent.PortInfo(removed={port_id_one, port_id_two})
+        expected_ports = dict(current=set(),
+                              added=set(),
+                              removed={port_id})
         with mock.patch.object(ovs_lib.BaseOVS, "port_exists",
                                return_value=False):
             self._test_process_ports_events(events.copy(), registered_ports,
@@ -543,33 +530,36 @@ class TestOvsNeutronAgent(object):
                                             expected_ancillary)
 
     def test_process_ports_events_returns_current_for_unchanged_ports(self):
-        events = {'added': [], 'removed': [], 'modified': []}
+        events = {'added': [], 'removed': []}
         registered_ports = {1, 3}
         ancillary_ports = {2, 5}
-        expected_ports = ovs_agent.PortInfo(current=registered_ports)
-        expected_ancillary = ovs_agent.PortInfo(current=ancillary_ports)
+        expected_ports = {'current': registered_ports, 'added': set(),
+                          'removed': set()}
+        expected_ancillary = {'current': ancillary_ports, 'added': set(),
+                              'removed': set()}
         self._test_process_ports_events(events, registered_ports,
                                         ancillary_ports, expected_ports,
                                         expected_ancillary)
 
     def test_process_port_events_no_vif_changes_return_updated_port_only(self):
-        events = {'added': [], 'removed': [], 'modified': []}
+        events = {'added': [], 'removed': []}
         registered_ports = {1, 2, 3}
         updated_ports = {2}
-        expected_ports = ovs_agent.PortInfo(current=registered_ports,
-                                            updated={2})
-        expected_ancillary = ovs_agent.PortInfo()
+        expected_ports = dict(current=registered_ports, updated={2},
+                              added=set(), removed=set())
+        expected_ancillary = dict(current=set(), added=set(), removed=set())
         self._test_process_ports_events(events, registered_ports,
                                         set(), expected_ports,
                                         expected_ancillary, updated_ports)
 
     def test_process_port_events_ignores_removed_port_if_never_added(self):
-        events = {'added': [], 'modified': [],
+        events = {'added': [],
                   'removed': [{'name': 'port2', 'ofport': 2,
                                'external_ids': {'attached-mac': 'test-mac'}}]}
         registered_ports = {1}
-        expected_ports = ovs_agent.PortInfo(current=registered_ports)
-        expected_ancillary = ovs_agent.PortInfo()
+        expected_ports = dict(current=registered_ports, added=set(),
+                              removed=set())
+        expected_ancillary = dict(current=set(), added=set(), removed=set())
         devices_not_ready_yet = set()
         with mock.patch.object(self.agent.int_br, 'portid_from_external_ids',
                                side_effect=[2]), \
@@ -589,13 +579,13 @@ class TestOvsNeutronAgent(object):
     def test_process_port_events_port_not_ready_yet(self):
         events = {'added': [{'name': 'port5', 'ofport': [],
                   'external_ids': {'attached-mac': 'test-mac'}}],
-                  'removed': [], 'modified': []}
+                  'removed': []}
         old_devices_not_ready = {'port4'}
-        registered_ports = {1, 2, 3}
-        expected_ports = ovs_agent.PortInfo(current={1, 2, 3, 4}, added={4},
-                                            removed=set())
+        registered_ports = set([1, 2, 3])
+        expected_ports = dict(current=set([1, 2, 3, 4]),
+                              added=set([4]), removed=set())
         self.agent.ancillary_brs = []
-        expected_ancillary = ovs_agent.PortInfo()
+        expected_ancillary = dict(current=set(), added=set(), removed=set())
         with mock.patch.object(self.agent.int_br, 'portid_from_external_ids',
                                side_effect=[5, 4]), \
             mock.patch.object(self.agent, 'check_changed_vlans',
@@ -623,14 +613,14 @@ class TestOvsNeutronAgent(object):
                   'removed': [{'name': 'port2', 'ofport': 2,
                                'external_ids': {'attached-mac': 'test-mac'}},
                               {'name': 'qg-port1', 'ofport': 5,
-                               'external_ids': {'attached-mac': 'test-mac'}}],
-                  'modified': []}
+                               'external_ids': {'attached-mac': 'test-mac'}}]}
         registered_ports = {1, 2, 4}
         ancillary_ports = {5, 8}
-        expected_ports = ovs_agent.PortInfo(current={1, 3, 4}, added={3},
-                                            removed={2}, updated=updated_ports)
-        expected_ancillary = ovs_agent.PortInfo(current={6, 8}, added={6},
-                                                removed={5})
+        expected_ports = dict(current={1, 3, 4}, added={3}, removed={2})
+        if updated_ports:
+            expected_ports['updated'] = updated_ports
+        expected_ancillary = dict(current={6, 8}, added={6},
+                                  removed={5})
         ancillary_bridge = mock.Mock()
         ancillary_bridge.get_vif_port_set.return_value = {5, 6, 8}
         self.agent.ancillary_brs = [ancillary_bridge]
@@ -674,8 +664,10 @@ class TestOvsNeutronAgent(object):
         vif_port_set = set([1, 3])
         registered_ports = set([1, 2])
         port_tags_dict = {1: []}
-        expected = ovs_agent.PortInfo(added={3}, current=vif_port_set,
-                                      removed={2}, updated={1})
+        expected = dict(
+            added=set([3]), current=vif_port_set,
+            removed=set([2]), updated=set([1])
+        )
         with mock.patch.object(self.agent, 'tun_br', autospec=True), \
                 mock.patch.object(self.agent.plugin_rpc,
                                   'update_device_list') as upd_l:
@@ -880,7 +872,7 @@ class TestOvsNeutronAgent(object):
                     return_value={}),\
                 mock.patch.object(self.agent, func_name) as func:
             skip_devs, _, need_bound_devices, _ = (
-                self.agent.treat_devices_added_or_updated([], False, set()))
+                self.agent.treat_devices_added_or_updated([], False))
             # The function should not raise
             self.assertFalse(skip_devs)
             return func.called
@@ -898,7 +890,7 @@ class TestOvsNeutronAgent(object):
                                   return_value={details['device']: port}),\
                 mock.patch.object(self.agent, 'port_dead') as func:
             skip_devs, binding_no_activated_devices, _, _ = (
-                self.agent.treat_devices_added_or_updated([], False, set()))
+                self.agent.treat_devices_added_or_updated([], False))
             self.assertFalse(skip_devs)
             self.assertTrue(func.called)
             self.assertIn('id', binding_no_activated_devices)
@@ -951,7 +943,7 @@ class TestOvsNeutronAgent(object):
             mock.patch.object(self.agent, 'treat_vif_port',
                               return_value=False):
 
-            self.agent.treat_devices_added_or_updated([], False, set())
+            self.agent.treat_devices_added_or_updated([], False)
 
     def test_treat_devices_added_updated_skips_if_port_not_found(self):
         dev_mock = mock.MagicMock()
@@ -970,8 +962,7 @@ class TestOvsNeutronAgent(object):
                                   "delete_port") as ext_mgr_delete_port,\
                 mock.patch.object(self.agent,
                                   'treat_vif_port') as treat_vif_port:
-            skip_devs = self.agent.treat_devices_added_or_updated(
-                [], False, set())
+            skip_devs = self.agent.treat_devices_added_or_updated([], False)
             # The function should return False for resync and no device
             # processed
             self.assertEqual((['the_skipped_one'], set(), [], set()),
@@ -993,7 +984,7 @@ class TestOvsNeutronAgent(object):
                                   'treat_vif_port') as treat_vif_port:
             failed_devices = {'added': set(), 'removed': set()}
             (_, _, _, failed_devices['added']) = (
-                self.agent.treat_devices_added_or_updated([], False, set()))
+                self.agent.treat_devices_added_or_updated([], False))
             # The function should return False for resync and no device
             # processed
             self.assertEqual(set([dev_mock]), failed_devices.get('added'))
@@ -1024,7 +1015,7 @@ class TestOvsNeutronAgent(object):
                 mock.patch.object(self.agent,
                                   'treat_vif_port') as treat_vif_port:
             skip_devs, _, need_bound_devices, _ = (
-                self.agent.treat_devices_added_or_updated([], False, set()))
+                self.agent.treat_devices_added_or_updated([], False))
             # The function should return False for resync
             self.assertFalse(skip_devs)
             self.assertTrue(treat_vif_port.called)
@@ -1155,7 +1146,7 @@ class TestOvsNeutronAgent(object):
                                      port_info.get('updated', set()))
             if devices_added_updated:
                 device_added_updated.assert_called_once_with(
-                    devices_added_updated, False, set())
+                    devices_added_updated, False)
             if port_info.get('removed', set()):
                 device_removed.assert_called_once_with(port_info['removed'])
             if skipped_devices:
@@ -1278,110 +1269,33 @@ class TestOvsNeutronAgent(object):
 
     def test_port_update_smartnic(self):
         cfg.CONF.set_default('baremetal_smartnic', True, group='AGENT')
-        network_id = 'e850ed99-5f46-47bc-8c06-86d9d519c46b'
-        port_arg = {"id": TEST_PORT_ID1, "network_id": network_id}
-        network = {'id': network_id, 'mtu': TEST_MTU}
+        port_arg = {"id": TEST_PORT_ID1}
         with mock.patch.object(self.agent.plugin_rpc.remote_resource_cache,
-                               "get_resource_by_id") as mocked_resource,\
-            mock.patch.object(self.agent.plugin_rpc,
-                              "get_network_details",
-                              return_value=network):
+                               "get_resource_by_id") as mocked_resource:
             port = Port()
             port['id'] = 'd850ed99-5f46-47bc-8c06-86d9d519c46a'
             port['mac_address'] = netaddr.EUI(FAKE_MAC)
             port['device_id'] = '0'
-            port['network_id'] = network_id
-            bindings_data = PortBinding()
-            bindings_data['host'] = 'host'
-            bindings_data['vnic_type'] = portbindings.VNIC_SMARTNIC
-            bindings_data['vif_type'] = portbindings.VIF_TYPE_OVS
-            bindings_data['profile'] = {
+            port_bind = PortBinding()
+            port_bind['host'] = 'host'
+            port_bind['vnic_type'] = portbindings.VNIC_SMARTNIC
+            port_bind['vif_type'] = 'ovs'
+            port_bind['profile'] = {
                 'local_link_information': [{'port_id': 'rep_port'}]}
-            port.bindings = [bindings_data]
+            port.bindings = [port_bind]
             mocked_resource.return_value = port
             self.agent.port_update("unused_context",
                                    port=port_arg)
-            expected_smartnic_port_data = {
+            expected_smartnic_data = {
                 'mac': port['mac_address'],
                 'vm_uuid': port['device_id'],
-                'vif_name': 'rep_port',
+                'iface_name': 'rep_port',
                 'iface_id': port['id'],
-                'vif_type': bindings_data['vif_type'],
-                'mtu': TEST_MTU
+                'vif_type': port_bind['vif_type']
             }
             self.assertEqual({TEST_PORT_ID1}, self.agent.updated_ports)
-            self.assertEqual([expected_smartnic_port_data],
+            self.assertEqual([expected_smartnic_data],
                              self.agent.updated_smartnic_ports)
-
-    def test_port_update_unbound_smartnic_port(self):
-        cfg.CONF.set_default('baremetal_smartnic', True, group='AGENT')
-        port_arg = {"id": 'd850ed99-5f46-47bc-8c06-86d9d519c46a'}
-        vif_name = "rep0-0"
-        vif_id = port_arg["id"]
-        vif_mac = FAKE_MAC
-        default_mtu = 1500
-        self.agent.current_smartnic_ports_map = {
-            vif_id: {
-                'vif_mac': vif_mac,
-                'vif_name': vif_name}}
-
-        with mock.patch.object(self.agent.plugin_rpc.remote_resource_cache,
-                               "get_resource_by_id") as mocked_resource:
-            port = Port()
-            port['id'] = port_arg["id"]
-            port['mac_address'] = netaddr.EUI(FAKE_MAC)
-            port['device_id'] = '0'
-            bindings_data = PortBinding()
-            bindings_data['host'] = ''
-            bindings_data['vnic_type'] = portbindings.VNIC_SMARTNIC
-            bindings_data['vif_type'] = portbindings.VIF_TYPE_UNBOUND
-            bindings_data['profile'] = {}
-            port.bindings = [bindings_data]
-            mocked_resource.return_value = port
-            self.agent.port_update("unused_context",
-                                   port=port_arg)
-            expected_smartnic_port_data = [{
-                'mac': port['mac_address'],
-                'vm_uuid': '',
-                'vif_name': 'rep0-0',
-                'iface_id': port['id'],
-                'vif_type': portbindings.VIF_TYPE_UNBOUND,
-                'mtu': default_mtu
-            }]
-            mocked_resource.assert_called_with(resources.PORT, port['id'])
-            self.assertEqual({port['id']}, self.agent.updated_ports)
-            self.assertEqual(expected_smartnic_port_data,
-                             self.agent.updated_smartnic_ports)
-
-    def test_port_update_unbound_smartnic_port_not_belong_to_the_agent(self):
-        cfg.CONF.set_default('baremetal_smartnic', True, group='AGENT')
-        port_arg = {"id": 'd850ed99-5f46-47bc-8c06-86d9d519c46a'}
-        vif_name = "rep0-0"
-        vif_id = 'd850ed99-5f46-47bc-8c06-86d9d519c46b'
-        vif_mac = FAKE_MAC
-        self.agent.current_smartnic_ports_map = {
-            vif_id: {
-                'vif_mac': vif_mac,
-                'vif_name': vif_name}}
-
-        with mock.patch.object(self.agent.plugin_rpc.remote_resource_cache,
-                               "get_resource_by_id") as mocked_resource:
-            port = Port()
-            port['id'] = port_arg["id"]
-            port['mac_address'] = netaddr.EUI(FAKE_MAC)
-            port['device_id'] = '0'
-            bindings_data = PortBinding()
-            bindings_data['host'] = ''
-            bindings_data['vnic_type'] = portbindings.VNIC_SMARTNIC
-            bindings_data['vif_type'] = portbindings.VIF_TYPE_UNBOUND
-            bindings_data['profile'] = {}
-            port.bindings = [bindings_data]
-            mocked_resource.return_value = port
-            self.agent.port_update("unused_context",
-                                   port=port_arg)
-            mocked_resource.assert_called_with(resources.PORT, port['id'])
-            self.assertEqual({port['id']}, self.agent.updated_ports)
-            self.assertEqual([], self.agent.updated_smartnic_ports)
 
     def test_port_delete_after_update(self):
         """Make sure a port is not marked for delete and update."""
@@ -1525,10 +1439,7 @@ class TestOvsNeutronAgent(object):
         self.assertIn('added_port_id', port_info['added'])
         self.assertNotIn('activated_port_id', port_info['added'])
 
-    def _test_setup_physical_bridges(self, port_exists=False,
-                                     dvr_enabled=False,
-                                     igmp_snooping_enabled=False):
-        self.agent.enable_distributed_routing = dvr_enabled
+    def _test_setup_physical_bridges(self, port_exists=False):
         with mock.patch.object(ip_lib.IPDevice, "exists") as devex_fn,\
                 mock.patch.object(sys, "exit"),\
                 mock.patch.object(self.agent, 'br_phys_cls') as phys_br_cls,\
@@ -1585,15 +1496,8 @@ class TestOvsNeutronAgent(object):
                         'phy-br-eth', constants.NONEXISTENT_PEER),
                 ]
             expected_calls += [
-                    mock.call.int_br.set_igmp_snooping_flood(
-                        'int-br-eth', igmp_snooping_enabled),
-                    mock.call.int_br.drop_port(in_port='int_ofport')
-            ]
-            if not dvr_enabled:
-                expected_calls += [
-                        mock.call.phys_br.drop_port(in_port='phy_ofport')
-                ]
-            expected_calls += [
+                mock.call.int_br.drop_port(in_port='int_ofport'),
+                mock.call.phys_br.drop_port(in_port='phy_ofport'),
                 mock.call.int_br.set_db_attribute('Interface', 'int-br-eth',
                                                   'options',
                                                   {'peer': 'phy-br-eth'}),
@@ -1612,9 +1516,6 @@ class TestOvsNeutronAgent(object):
 
     def test_setup_physical_bridges_port_exists(self):
         self._test_setup_physical_bridges(port_exists=True)
-
-    def test_setup_physical_bridges_dvr_enabled(self):
-        self._test_setup_physical_bridges(dvr_enabled=True)
 
     def test_setup_physical_bridges_using_veth_interconnection(self):
         self.agent.use_veth_interconnection = True
@@ -1655,10 +1556,6 @@ class TestOvsNeutronAgent(object):
                              self.agent.phys_ofports["physnet1"])
             int_br.add_port.assert_called_with("int-br-eth")
             phys_br.add_port.assert_called_with("phy-br-eth")
-
-    def test_setup_physical_bridges_igmp_snooping_enabled(self):
-        cfg.CONF.set_override('igmp_snooping_enable', True, 'OVS')
-        self._test_setup_physical_bridges(igmp_snooping_enabled=True)
 
     def _test_setup_physical_bridges_change_from_veth_to_patch_conf(
             self, port_exists=False):
@@ -1715,8 +1612,6 @@ class TestOvsNeutronAgent(object):
                         'phy-br-eth', constants.NONEXISTENT_PEER),
                 ]
             expected_calls += [
-                mock.call.int_br.set_igmp_snooping_flood(
-                    'int-br-eth', False),
                 mock.call.int_br.drop_port(in_port='int_ofport'),
                 mock.call.phys_br.drop_port(in_port='phy_ofport'),
                 mock.call.int_br.set_db_attribute('Interface', 'int-br-eth',
@@ -1757,8 +1652,6 @@ class TestOvsNeutronAgent(object):
                                   return_value=False),\
                 mock.patch.object(self.agent.int_br, 'port_exists',
                                   return_value=False),\
-                mock.patch.object(self.agent.int_br,
-                                  'set_igmp_snooping_flood'),\
                 mock.patch.object(sys, "exit"):
             self.agent.setup_tunnel_br(None)
             self.agent.setup_tunnel_br()
@@ -1783,8 +1676,6 @@ class TestOvsNeutronAgent(object):
                                   "add_patch_port") as int_patch_port,\
                 mock.patch.object(self.agent.tun_br,
                                   "add_patch_port") as tun_patch_port,\
-                mock.patch.object(self.agent.int_br,
-                                  'set_igmp_snooping_flood'),\
                 mock.patch.object(sys, "exit"):
             self.agent.setup_tunnel_br(None)
             self.agent.setup_tunnel_br()
@@ -2326,12 +2217,10 @@ class TestOvsNeutronAgent(object):
                 pass
 
             process_p_events.assert_has_calls([
-                mock.call({'removed': [], 'added': [], 'modified': []},
-                          set(), set(), set(),
+                mock.call({'removed': [], 'added': []}, set(), set(), set(),
                           failed_devices, failed_ancillary_devices,
                           set()),
-                mock.call({'removed': [], 'added': [], 'modified': []},
-                          set(['tap0']), set(),
+                mock.call({'removed': [], 'added': []}, set(['tap0']), set(),
                           set(), failed_devices, failed_ancillary_devices,
                           set())
             ])
@@ -2363,23 +2252,6 @@ class TestOvsNeutronAgent(object):
         # OVS will not DEAD in some exception, like DBConnectionError.
         self._test_ovs_status(constants.OVS_NORMAL,
                               constants.OVS_RESTARTED)
-
-    def test_ovs_restart_for_ingress_direct_goto_flows(self):
-        with mock.patch.object(self.agent,
-                               'check_ovs_status',
-                               return_value=constants.OVS_RESTARTED), \
-             mock.patch.object(self.agent,
-                               '_agent_has_updates',
-                               side_effect=TypeError('loop exit')), \
-             mock.patch.object(self.agent, 'setup_integration_br'), \
-             mock.patch.object(self.agent,
-                               'install_ingress_direct_goto_flows') as \
-                install_ingress_direct_goto_flows:
-            try:
-                self.agent.rpc_loop(polling_manager=mock.Mock())
-            except TypeError:
-                pass
-        install_ingress_direct_goto_flows.assert_called_once_with()
 
     def test_rpc_loop_fail_to_process_network_ports_keep_flows(self):
         with mock.patch.object(async_process.AsyncProcess, "_spawn"),\
@@ -2696,15 +2568,14 @@ class TestOvsNeutronAgent(object):
         smartnic_data = {
             'mac': mac,
             'vm_uuid': vm_uuid,
-            'vif_name': rep_port,
+            'iface_name': rep_port,
             'iface_id': iface_id,
-            'vif_type': vif_type,
-            'mtu': TEST_MTU}
+            'vif_type': vif_type}
 
         cfg.CONF.set_default('baremetal_smartnic', True, group='AGENT')
         agent = self._make_agent()
         instance_info = vif_instance_object.InstanceInfo(uuid=vm_uuid)
-        vif = agent._get_vif_object(iface_id, rep_port, mac, TEST_MTU)
+        vif = agent._get_vif_object(iface_id, rep_port, mac)
         with mock.patch.object(os_vif, 'plug') as plug_mock, \
                 mock.patch.object(os_vif, 'unplug') as unplug_mock, \
                 mock.patch('os_vif.objects.instance_info.InstanceInfo',
@@ -2714,7 +2585,7 @@ class TestOvsNeutronAgent(object):
 
             agent.treat_smartnic_port(smartnic_data)
 
-            if vif_type == portbindings.VIF_TYPE_OVS:
+            if vif_type == 'ovs':
                 plug_mock.assert_called_once_with(vif, instance_info)
             else:
                 unplug_mock.assert_called_once_with(vif, instance_info)
@@ -2725,143 +2596,96 @@ class TestOvsNeutronAgent(object):
     def test_treat_smartnic_port_remove(self):
         self._test_treat_smartnic_port('unbound')
 
-    def test_process_smartnic_ports_remove(self):
-        port_id = "407a79e0-e0be-4b7d-92a6-513b2161011a"
-        rep_port = 'rep0-0'
-        mac = FAKE_MAC
-        ovs_port = mock.Mock()
-        ovs_port.vif_mac = mac
-        ovs_port.port_name = rep_port
-        ovs_port.vif_id = port_id
-        ports_int_br = [ovs_port]
-        default_mtu = 1500
-        expected_smartnic_ports_processed_list = [
-            {'iface_id': port_id,
-             'vif_name': rep_port,
-             'mac': mac,
-             'vif_type': portbindings.VIF_TYPE_UNBOUND,
-             'vm_uuid': '',
-             'mtu': default_mtu}]
-        expected_current_smartnic_ports_map = {
-            port_id: {
-                'vif_mac': mac,
-                'vif_name': rep_port}}
-        with mock.patch.object(self.agent.plugin_rpc,
-                               "get_ports_by_vnic_type_and_host",
-                               return_value=[]),\
-                mock.patch.object(self.agent.int_br,
-                                  "get_vif_ports",
-                                  return_value=ports_int_br):
-            self.agent.process_smartnic_ports()
-            self.assertEqual(expected_smartnic_ports_processed_list,
-                             self.agent.updated_smartnic_ports)
-            self.assertEqual(expected_current_smartnic_ports_map,
-                             self.agent.current_smartnic_ports_map)
-
     def test_process_smartnic_ports(self):
-        port_id = "407a79e0-e0be-4b7d-92a6-513b2161011a"
+        port_id_int_br = "407a79e0-e0be-4b7d-92a6-513b2161011a"
+        vm_uuid = "407a79e0-e0be-4b7d-92a6-513b2161011b"
+        iface_id = "407a79e0-e0be-4b7d-92a6-513b2161011c"
         rep_port = 'rep0-0'
         mac = FAKE_MAC
-        ovs_port = mock.Mock()
-        ovs_port.vif_mac = mac
-        ovs_port.port_name = rep_port
-        ovs_port.vif_id = port_id
-        ports_int_br = [ovs_port]
-        default_mtu = 1500
-        network = {'id': TEST_NETWORK_ID1, 'mtu': TEST_MTU}
-
+        vif_type = "ovs"
+        EXISTING_PORT = {'id': port_id_int_br}
         PORT_TO_PROCESS = {
             'binding:profile': {'local_link_information': [
                 {'hostname': 'host1', 'port_id': rep_port}]},
             'mac_address': FAKE_MAC,
-            'device_id': "407a79e0-e0be-4b7d-92a6-513b2161011e",
-            'id': "407a79e0-e0be-4b7d-92a6-513b2161011c",
-            'binding:vif_type': portbindings.VIF_TYPE_OVS,
-            'network_id': TEST_NETWORK_ID1
+            'device_id': vm_uuid,
+            'id': iface_id,
+            'binding:vif_type': vif_type
         }
-        expected_smartnic_ports_processed_list = [
-            {'iface_id': port_id,
-             'vif_name': rep_port,
-             'mac': mac,
-             'vif_type': portbindings.VIF_TYPE_UNBOUND,
-             'vm_uuid': '',
-             'mtu': default_mtu},
-            {'iface_id': "407a79e0-e0be-4b7d-92a6-513b2161011c",
-             'vif_name': rep_port,
-             'mac': mac,
-             'vif_type': portbindings.VIF_TYPE_OVS,
-             'vm_uuid': "407a79e0-e0be-4b7d-92a6-513b2161011e",
-             'mtu': TEST_MTU}]
-        expected_current_smartnic_ports_map = {
-            port_id: {
-                'vif_mac': mac,
-                'vif_name': rep_port}}
-        with mock.patch.object(self.agent.plugin_rpc,
-                               "get_ports_by_vnic_type_and_host",
-                               return_value=[PORT_TO_PROCESS]),\
-            mock.patch.object(self.agent.int_br,
-                              "get_vif_ports",
-                              return_value=ports_int_br),\
-            mock.patch.object(self.agent.plugin_rpc,
-                              "get_network_details",
-                              return_value=network):
+        with mock.patch.object(self.agent.int_br,
+                               'get_vif_port_set',
+                               return_value={port_id_int_br}),\
+                mock.patch.object(self.agent.plugin_rpc,
+                                  "get_ports_by_vnic_type_and_host",
+                                  return_value=[EXISTING_PORT,
+                                                PORT_TO_PROCESS]):
+            smartnic_data = {
+                'mac': mac,
+                'vm_uuid': vm_uuid,
+                'iface_name': rep_port,
+                'iface_id': iface_id,
+                'vif_type': vif_type}
             self.agent.process_smartnic_ports()
-            self.assertEqual(expected_smartnic_ports_processed_list,
+            self.assertEqual([smartnic_data],
                              self.agent.updated_smartnic_ports)
-            self.assertEqual(expected_current_smartnic_ports_map,
-                             self.agent.current_smartnic_ports_map)
 
-    def test_add_bound_port_to_updated_smartnic_ports(self):
-        mac = FAKE_MAC
+    def test_add_port_to_updated_smartnic_ports_port_as_dict(self):
         vm_uuid = "407a79e0-e0be-4b7d-92a6-513b2161011b"
-        rep_port = 'rep0-0'
         iface_id = "407a79e0-e0be-4b7d-92a6-513b2161011c"
+        rep_port = 'rep0-0'
+        mac = FAKE_MAC
+        vif_type = "ovs"
+        PORT_TO_PROCESS = {
+            'binding:profile': {'local_link_information': [
+                {'hostname': 'host1', 'port_id': rep_port}]},
+            'mac_address': FAKE_MAC,
+            'device_id': vm_uuid,
+            'id': iface_id,
+            'binding:vif_type': vif_type
+        }
         self.agent._add_port_to_updated_smartnic_ports(
-            mac,
-            rep_port,
-            iface_id,
-            portbindings.VIF_TYPE_OVS,
-            vm_uuid,
-            TEST_MTU)
+            PORT_TO_PROCESS,
+            {'profile': PORT_TO_PROCESS['binding:profile'],
+             'vif_type': PORT_TO_PROCESS['binding:vif_type']})
 
         smartnic_data = {
             'mac': mac,
             'vm_uuid': vm_uuid,
-            'vif_name': rep_port,
+            'iface_name': rep_port,
             'iface_id': iface_id,
-            'vif_type': portbindings.VIF_TYPE_OVS,
-            'mtu': TEST_MTU}
+            'vif_type': vif_type}
         self.assertEqual([smartnic_data],
                          self.agent.updated_smartnic_ports)
 
-    def test_add_unbound_port_to_updated_smartnic_ports(self):
-        vif_mac = FAKE_MAC
-        vif_name = 'rep0-0'
-        vif_id = "407a79e0-e0be-4b7d-92a6-513b2161011a"
-        self.agent._add_port_to_updated_smartnic_ports(
-            vif_mac,
-            vif_name,
-            vif_id,
-            portbindings.VIF_TYPE_UNBOUND,
-            mtu=TEST_MTU)
-        smartnic_data = {
-            'mac': vif_mac,
-            'vm_uuid': '',
-            'vif_name': vif_name,
-            'iface_id': vif_id,
-            'vif_type': portbindings.VIF_TYPE_UNBOUND,
-            'mtu': TEST_MTU}
-        self.assertEqual([smartnic_data],
-                         self.agent.updated_smartnic_ports)
-
-    def test_create_smartnic_port_map_entry_data(self):
-        mac = FAKE_MAC
+    def test_add_port_to_updated_smartnic_ports_port_as_object(self):
+        vm_uuid = "407a79e0-e0be-4b7d-92a6-513b2161011b"
+        iface_id = "407a79e0-e0be-4b7d-92a6-513b2161011c"
         rep_port = 'rep0-0'
-        expected_return_value = {"vif_mac": mac,
-                                 "vif_name": rep_port}
-        int_br_smartnic_port_map =\
-            self.agent.create_smartnic_port_map_entry_data(mac, rep_port)
-        self.assertEqual(int_br_smartnic_port_map, expected_return_value)
+        mac = FAKE_MAC
+        vif_type = "ovs"
+
+        port = Port()
+        port['id'] = iface_id
+        port['mac_address'] = netaddr.EUI(mac)
+        port['device_id'] = vm_uuid
+        port_bind = PortBinding()
+        port_bind['profile'] = {'local_link_information': [
+            {'hostname': 'host1', 'port_id': rep_port}]}
+        port_bind['vif_type'] = vif_type
+        port_bind['host'] = 'host'
+        port_bind['vnic_type'] = portbindings.VNIC_SMARTNIC
+        port.bindings = [port_bind]
+
+        self.agent._add_port_to_updated_smartnic_ports(port, port_bind)
+
+        smartnic_data = {
+            'mac': mac,
+            'vm_uuid': vm_uuid,
+            'iface_name': rep_port,
+            'iface_id': iface_id,
+            'vif_type': vif_type}
+        self.assertEqual([smartnic_data],
+                         self.agent.updated_smartnic_ports)
 
 
 class TestOvsNeutronAgentOSKen(TestOvsNeutronAgent,
@@ -2996,23 +2820,24 @@ class AncillaryBridgesTest(object):
     def test_scan_ancillary_ports_returns_cur_only_for_unchanged_ports(self):
         vif_port_set = set([1, 2])
         registered_ports = set([1, 2])
-        expected = ovs_agent.PortInfo(current=vif_port_set)
+        expected = dict(current=vif_port_set,
+                        added=set(),
+                        removed=set())
         actual = self.mock_scan_ancillary_ports(vif_port_set, registered_ports)
         self.assertEqual(expected, actual)
 
     def test_scan_ancillary_ports_returns_port_changes(self):
         vif_port_set = set([1, 3])
         registered_ports = set([1, 2])
-        expected = ovs_agent.PortInfo(current=vif_port_set, added={3},
-                                      removed={2})
+        expected = dict(current=vif_port_set, added=set([3]), removed=set([2]))
         actual = self.mock_scan_ancillary_ports(vif_port_set, registered_ports)
         self.assertEqual(expected, actual)
 
     def test_scan_ancillary_ports_returns_port_changes_with_sync(self):
         vif_port_set = set([1, 3])
         registered_ports = set([1, 2])
-        expected = ovs_agent.PortInfo(current=vif_port_set, added=vif_port_set,
-                                      removed={2})
+        expected = dict(current=vif_port_set, added=vif_port_set,
+                        removed=set([2]))
         actual = self.mock_scan_ancillary_ports(vif_port_set, registered_ports,
                                                 sync=True)
         self.assertEqual(expected, actual)
@@ -3103,15 +2928,6 @@ class TestOvsDvrNeutronAgent(object):
         self._compute_fixed_ips = [{'subnet_id': 'my-subnet-uuid',
                                     'ip_address': '1.1.1.3'}]
 
-    def _setup_extra_port_for_dvr(self):
-        self._port_nongateway = mock.Mock()
-        self._port_nongateway.ofport = 11
-        self._port_nongateway.vif_id = "1234-5678-99"
-        self._port_nongateway.vif_mac = 'aa:bb:cc:11:22:44'
-        self._port_nongateway.dvr_mac = self.agent.dvr_agent.dvr_mac_address
-        self._fixed_ips_nongateway = [{'subnet_id': 'my-subnet-uuid',
-                                       'ip_address': '1.1.1.11'}]
-
     @staticmethod
     def _expected_port_bound(port, lvid, is_dvr=True,
                              network_type=n_const.TYPE_VXLAN):
@@ -3169,8 +2985,8 @@ class TestOvsDvrNeutronAgent(object):
             ),
         ]
 
-    def _test_port_bound_for_dvr_on_physical_network(
-            self, device_owner, network_type, ip_version=n_const.IP_VERSION_4):
+    def _test_port_bound_for_dvr_on_vlan_network(
+            self, device_owner, ip_version=n_const.IP_VERSION_4):
         self._setup_for_dvr_test()
         if ip_version == n_const.IP_VERSION_4:
             gateway_ip = '1.1.1.10'
@@ -3184,8 +3000,7 @@ class TestOvsDvrNeutronAgent(object):
         self._compute_port.vif_mac = '77:88:99:00:11:22'
         physical_network = self._physical_network
         segmentation_id = self._segmentation_id
-        if network_type == n_const.TYPE_FLAT:
-            segmentation_id = None
+        network_type = n_const.TYPE_VLAN
         int_br = mock.create_autospec(self.agent.int_br)
         tun_br = mock.create_autospec(self.agent.tun_br)
         phys_br = mock.create_autospec(self.br_phys_cls('br-phys'))
@@ -3348,19 +3163,10 @@ class TestOvsDvrNeutronAgent(object):
             self.assertEqual([], phys_br.mock_calls)
 
     def test_port_bound_for_dvr_with_compute_ports(self):
-        self._test_port_bound_for_dvr_on_physical_network(
+        self._test_port_bound_for_dvr_on_vlan_network(
+            device_owner=DEVICE_OWNER_COMPUTE)
+        self._test_port_bound_for_dvr_on_vlan_network(
             device_owner=DEVICE_OWNER_COMPUTE,
-            network_type=n_const.TYPE_VLAN)
-        self._test_port_bound_for_dvr_on_physical_network(
-            device_owner=DEVICE_OWNER_COMPUTE,
-            network_type=n_const.TYPE_VLAN,
-            ip_version=n_const.IP_VERSION_6)
-        self._test_port_bound_for_dvr_on_physical_network(
-            device_owner=DEVICE_OWNER_COMPUTE,
-            network_type=n_const.TYPE_FLAT)
-        self._test_port_bound_for_dvr_on_physical_network(
-            device_owner=DEVICE_OWNER_COMPUTE,
-            network_type=n_const.TYPE_FLAT,
             ip_version=n_const.IP_VERSION_6)
         self._test_port_bound_for_dvr_on_vxlan_network(
             device_owner=DEVICE_OWNER_COMPUTE)
@@ -3369,19 +3175,10 @@ class TestOvsDvrNeutronAgent(object):
             ip_version=n_const.IP_VERSION_6)
 
     def test_port_bound_for_dvr_with_dhcp_ports(self):
-        self._test_port_bound_for_dvr_on_physical_network(
+        self._test_port_bound_for_dvr_on_vlan_network(
+            device_owner=n_const.DEVICE_OWNER_DHCP)
+        self._test_port_bound_for_dvr_on_vlan_network(
             device_owner=n_const.DEVICE_OWNER_DHCP,
-            network_type=n_const.TYPE_VLAN)
-        self._test_port_bound_for_dvr_on_physical_network(
-            device_owner=n_const.DEVICE_OWNER_DHCP,
-            network_type=n_const.TYPE_VLAN,
-            ip_version=n_const.IP_VERSION_6)
-        self._test_port_bound_for_dvr_on_physical_network(
-            device_owner=n_const.DEVICE_OWNER_DHCP,
-            network_type=n_const.TYPE_FLAT)
-        self._test_port_bound_for_dvr_on_physical_network(
-            device_owner=n_const.DEVICE_OWNER_DHCP,
-            network_type=n_const.TYPE_FLAT,
             ip_version=n_const.IP_VERSION_6)
         self._test_port_bound_for_dvr_on_vxlan_network(
             device_owner=n_const.DEVICE_OWNER_DHCP)
@@ -3515,155 +3312,6 @@ class TestOvsDvrNeutronAgent(object):
                 n_const.DEVICE_OWNER_ROUTER_SNAT,
                 False)
             self.assertFalse(int_br.install_dvr_to_src_mac.called)
-
-    def _test_port_unbound_dvr_router_port_on_vxlan_network(
-            self, port_type='gateway', ip_version=n_const.IP_VERSION_4):
-        """Test DVR ovs flows when router port is unbound.
-
-        Setup 2 ports from same subnet to a DVR router. Add an instance port.
-        Remove one of the router ports based on port_type passed to the
-        function. port_type='gateway' removes the gateway port, port_type
-        nongateway removes the non-gateway port. port_type='all' removes
-        both the ports. Verify if the corresponding ovs flows are updated.
-        """
-        self._setup_for_dvr_test()
-        self._setup_extra_port_for_dvr()
-
-        if ip_version == n_const.IP_VERSION_4:
-            gateway_ip = '1.1.1.1'
-            cidr = '1.1.1.0/24'
-        else:
-            gateway_ip = '2001:db8:100::1'
-            cidr = '2001:db8:100::0/64'
-            self._fixed_ips = [{'subnet_id': 'my-subnet-uuid',
-                               'ip_address': '2001:db8:100::1'}]
-            self._fixed_ips_nongateway = [{'subnet_id': 'my-subnet-uuid',
-                                          'ip_address': '2001:db8:100::10'}]
-        network_type = n_const.TYPE_VXLAN
-        self._port.vif_mac = gateway_mac = 'aa:bb:cc:11:22:33'
-        self._port.dvr_mac = self.agent.dvr_agent.dvr_mac_address
-        self._compute_port.vif_mac = '77:88:99:00:11:22'
-        physical_network = self._physical_network
-        segmentation_id = self._segmentation_id
-
-        int_br = mock.create_autospec(self.agent.int_br)
-        tun_br = mock.create_autospec(self.agent.tun_br)
-        phys_br = mock.create_autospec(self.br_phys_cls('br-phys'))
-        int_br.set_db_attribute.return_value = True
-        int_br.db_get_val.return_value = {}
-        with mock.patch.object(self.agent.dvr_agent.plugin_rpc,
-                               'get_subnet_for_dvr',
-                               return_value={'gateway_ip': gateway_ip,
-                                             'cidr': cidr,
-                                             'ip_version': ip_version,
-                                             'gateway_mac': gateway_mac}),\
-                mock.patch.object(self.agent.dvr_agent.plugin_rpc,
-                                  'get_ports_on_host_by_subnet',
-                                  return_value=[]),\
-                mock.patch.object(self.agent.dvr_agent.int_br,
-                                  'get_vif_port_by_id',
-                                  return_value=self._port),\
-                mock.patch.object(self.agent, 'int_br', new=int_br),\
-                mock.patch.object(self.agent, 'tun_br', new=tun_br),\
-                mock.patch.dict(self.agent.phys_brs,
-                                {physical_network: phys_br}),\
-                mock.patch.object(self.agent.dvr_agent, 'int_br', new=int_br),\
-                mock.patch.object(self.agent.dvr_agent, 'tun_br', new=tun_br),\
-                mock.patch.dict(self.agent.dvr_agent.phys_brs,
-                                {physical_network: phys_br}):
-            self.agent.port_bound(
-                self._port, self._net_uuid, network_type,
-                physical_network, segmentation_id, self._fixed_ips,
-                n_const.DEVICE_OWNER_DVR_INTERFACE, False)
-
-            lvid = self.agent.vlan_manager.get(self._net_uuid).vlan
-
-            # Bound non-gateway port
-            self.agent.port_bound(
-                self._port_nongateway, self._net_uuid, network_type,
-                physical_network, segmentation_id, self._fixed_ips_nongateway,
-                n_const.DEVICE_OWNER_DVR_INTERFACE, False)
-
-            # Bound compute port
-            self.agent.port_bound(self._compute_port, self._net_uuid,
-                                  network_type, physical_network,
-                                  segmentation_id,
-                                  self._compute_fixed_ips,
-                                  DEVICE_OWNER_COMPUTE, False)
-
-            int_br.reset_mock()
-            tun_br.reset_mock()
-            phys_br.reset_mock()
-
-            ports_to_unbind = {}
-            expected_br_int_mock_calls_gateway_port = 2
-            expected_br_int_mock_calls_nongateway_port = 1
-            if port_type == 'gateway':
-                ports_to_unbind = {
-                    self._port: expected_br_int_mock_calls_gateway_port
-                }
-            elif port_type == 'nongateway':
-                ports_to_unbind = {
-                    self._port_nongateway:
-                    expected_br_int_mock_calls_nongateway_port
-                }
-            else:
-                ports_to_unbind = {
-                    self._port:
-                    expected_br_int_mock_calls_gateway_port,
-                    self._port_nongateway:
-                    expected_br_int_mock_calls_nongateway_port
-                }
-
-            for port_to_unbind, br_int_mock_calls in ports_to_unbind.items():
-                self.agent.port_unbound(port_to_unbind.vif_id)
-                expected_on_int_br = self._expected_port_unbound(
-                    port_to_unbind, lvid, True, network_type)
-
-                if ip_version == n_const.IP_VERSION_4:
-                    expected_on_tun_br = [
-                        mock.call.delete_dvr_process_ipv4(
-                            vlan_tag=lvid,
-                            gateway_ip=gateway_ip),
-                    ]
-                else:
-                    expected_on_tun_br = [
-                        mock.call.delete_dvr_process_ipv6(
-                            vlan_tag=lvid,
-                            gateway_mac=gateway_mac),
-                    ]
-                expected_on_tun_br.extend([
-                    mock.call.delete_dvr_process(
-                        vlan_tag=lvid,
-                        vif_mac=port_to_unbind.vif_mac),
-                ])
-
-                int_br.assert_has_calls(expected_on_int_br)
-                self.assertEqual(br_int_mock_calls, len(int_br.mock_calls))
-                tun_br.assert_has_calls(expected_on_tun_br)
-                int_br.reset_mock()
-                tun_br.reset_mock()
-                phys_br.assert_not_called()
-                phys_br.reset_mock()
-
-    def test_port_unbound_dvr_router_port(self):
-        self._test_port_unbound_dvr_router_port_on_vxlan_network(
-            port_type='gateway')
-        self._test_port_unbound_dvr_router_port_on_vxlan_network(
-            port_type='nongateway')
-        # Unbound all the dvr router ports
-        self._test_port_unbound_dvr_router_port_on_vxlan_network(
-            port_type='all')
-        self._test_port_unbound_dvr_router_port_on_vxlan_network(
-            port_type='gateway',
-            ip_version=n_const.IP_VERSION_6)
-        self._test_port_unbound_dvr_router_port_on_vxlan_network(
-            port_type='nongateway',
-            ip_version=n_const.IP_VERSION_6)
-        # Unbound all the dvr router ports
-        self._test_port_unbound_dvr_router_port_on_vxlan_network(
-            port_type='all',
-            ip_version=n_const.IP_VERSION_6)
 
     def test_treat_devices_removed_for_dvr_interface(self):
         self._test_treat_devices_removed_for_dvr_interface()
@@ -3999,9 +3647,8 @@ class TestOvsDvrNeutronAgent(object):
                 mock.call.setup_canary_table(),
                 mock.call.install_drop(table_id=constants.DVR_TO_SRC_MAC,
                                        priority=1),
-                mock.call.install_drop(
-                    table_id=constants.DVR_TO_SRC_MAC_PHYSICAL,
-                    priority=1),
+                mock.call.install_drop(table_id=constants.DVR_TO_SRC_MAC_VLAN,
+                                       priority=1),
                 mock.call.install_drop(table_id=constants.LOCAL_SWITCHING,
                                        priority=2,
                                        in_port=ioport),
@@ -4029,8 +3676,7 @@ class TestOvsDvrNeutronAgent(object):
                                'get_dvr_mac_address_by_host',
                                side_effect=oslo_messaging.RemoteError),\
                 mock.patch.object(self.agent, 'int_br', new=int_br),\
-                mock.patch.object(self.agent.dvr_agent, 'int_br', new=int_br),\
-                mock.patch.object(ovs_dvr_neutron_agent.LOG, 'error'):
+                mock.patch.object(self.agent.dvr_agent, 'int_br', new=int_br):
             with testtools.ExpectedException(SystemExit):
                 self.agent.dvr_agent.get_dvr_mac_address()
                 self.assertIsNone(self.agent.dvr_agent.dvr_mac_address)
@@ -4093,7 +3739,7 @@ class TestOvsDvrNeutronAgent(object):
                     dvr_macs=[{'host': newhost,
                                'mac_address': newmac}])
             expected_on_int_br = [
-                mock.call.add_dvr_mac_physical(
+                mock.call.add_dvr_mac_vlan(
                     mac=newmac,
                     port=self.agent.int_ofports[physical_network]),
                 mock.call.add_dvr_mac_tun(
@@ -4106,7 +3752,7 @@ class TestOvsDvrNeutronAgent(object):
                     port=self.agent.patch_int_ofport),
             ]
             expected_on_phys_br = [
-                mock.call.add_dvr_mac_physical(
+                mock.call.add_dvr_mac_vlan(
                     mac=newmac,
                     port=self.agent.phys_ofports[physical_network]),
             ]
@@ -4204,56 +3850,6 @@ class TestOvsDvrNeutronAgent(object):
             with mock.patch.object(self.agent, 'update_stale_ofport_rules'):
                 self.agent.ancillary_brs = mock.Mock()
                 self._test_scan_ports_failure('scan_ancillary_ports')
-
-    def test_ext_br_recreated(self):
-        self._setup_for_dvr_test()
-        reset_methods = (
-            'reset_ovs_parameters', 'reset_dvr_parameters',
-            'setup_dvr_flows_on_integ_br', 'setup_dvr_flows_on_tun_br',
-            'setup_dvr_flows_on_phys_br', 'setup_dvr_mac_flows_on_all_brs')
-        for method in reset_methods:
-            mock.patch.object(self.agent.dvr_agent, method).start()
-        bridge_mappings = {'physnet0': 'br-ex0',
-                           'physnet1': 'br-ex1'}
-        ex_br_mocks = [mock.Mock(br_name='br-ex0'),
-                       mock.Mock(br_name='br-ex1')]
-        phys_bridges = {'physnet0': ex_br_mocks[0],
-                        'physnet1': ex_br_mocks[1]},
-        bridges_added = ['br-ex0']
-        with mock.patch.object(self.agent, 'check_ovs_status',
-                               return_value=constants.OVS_NORMAL), \
-                mock.patch.object(self.agent, '_agent_has_updates',
-                                  side_effect=TypeError('loop exit')), \
-                mock.patch.dict(self.agent.bridge_mappings, bridge_mappings,
-                                clear=True), \
-                mock.patch.dict(self.agent.phys_brs, phys_bridges,
-                                clear=True), \
-                mock.patch.object(self.agent, 'setup_physical_bridges') as \
-                setup_physical_bridges, \
-                mock.patch.object(self.agent.ovs.ovsdb, 'idl_monitor') as \
-                mock_idl_monitor:
-            mock_idl_monitor.bridges_added = bridges_added
-            try:
-                self.agent.rpc_loop(polling_manager=mock.Mock())
-            except TypeError:
-                pass
-        # Setup bridges should be called once even if it will raise Runtime
-        # Error because TypeError is raised in _agent_has_updates to stop
-        # agent after first loop iteration
-        setup_physical_bridges.assert_called_once_with({'physnet0': 'br-ex0'})
-        # Ensure dvr_agent methods were called correctly
-        self.agent.dvr_agent.reset_ovs_parameters.assert_called_once_with(
-            self.agent.int_br, self.agent.tun_br, self.agent.phys_brs,
-            self.agent.patch_int_ofport, self.agent.patch_tun_ofport)
-        self.agent.dvr_agent.reset_dvr_parameters.assert_called_once_with()
-        (self.agent.dvr_agent.setup_dvr_flows_on_phys_br.
-         assert_called_once_with({'physnet0': 'br-ex0'}))
-        (self.agent.dvr_agent.setup_dvr_flows_on_integ_br.
-            assert_called_once_with())
-        (self.agent.dvr_agent.setup_dvr_flows_on_tun_br.
-            assert_called_once_with())
-        (self.agent.dvr_agent.setup_dvr_mac_flows_on_all_brs.
-            assert_called_once_with())
 
 
 class TestOvsDvrNeutronAgentOSKen(TestOvsDvrNeutronAgent,

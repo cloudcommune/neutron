@@ -16,10 +16,8 @@
 import functools
 
 import mock
-from neutron_lib import constants as p_const
 from neutron_lib.services.qos import constants as qos_constants
 from oslo_utils import uuidutils
-from ovsdbapp.backend.ovs_idl import event
 import six
 
 from neutron.agent.common import ovs_lib
@@ -37,17 +35,6 @@ QUEUE_NUM_DEFAULT = 'queue_num'
 OTHER_CONFIG_DEFAULT = {six.u('max-rate'): six.u(str(MAX_RATE_DEFAULT)),
                         six.u('burst'): six.u(str(BURST_DEFAULT)),
                         six.u('min-rate'): six.u(str(MIN_RATE_DEFAULT))}
-
-
-class WaitForPortCreateEvent(event.WaitEvent):
-    event_name = 'WaitForPortCreateEvent'
-
-    def __init__(self, port_name):
-        table = 'Port'
-        events = (self.ROW_CREATE,)
-        conditions = (('name', '=', port_name),)
-        super(WaitForPortCreateEvent, self).__init__(
-            events, table, conditions, timeout=5)
 
 
 class BaseOVSTestCase(base.BaseSudoTestCase):
@@ -124,11 +111,7 @@ class BaseOVSTestCase(base.BaseSudoTestCase):
         self.elements_to_clean['bridges'].append(self.br_name)
 
     def _create_port(self, port_name):
-        row_event = WaitForPortCreateEvent(port_name)
-        self.ovs.ovsdb.idl.notify_handler.watch_event(row_event)
-        self.ovs.ovsdb.add_port(self.br_name, port_name).execute(
-            check_error=True)
-        self.assertTrue(row_event.wait())
+        self.ovs.ovsdb.add_port(self.br_name, port_name).execute()
 
     def _find_port_uuid(self, port_name):
         return self.ovs.ovsdb.db_get('Port', port_name, '_uuid').execute()
@@ -292,7 +275,7 @@ class BaseOVSTestCase(base.BaseSudoTestCase):
         self._check_value((qos_id, queues), self.ovs._find_qos)
 
     def test__set_port_qos(self):
-        port_name = ('port-' + uuidutils.generate_uuid())[:8]
+        port_name = 'test_port'
         self._create_bridge()
         self._create_port(port_name)
         self._check_value([], self._find_port_qos, port_name)
@@ -334,7 +317,7 @@ class BaseOVSTestCase(base.BaseSudoTestCase):
         self.assertNotIn(expected, flows)
 
     def test_update_minimum_bandwidth_queue(self):
-        port_name = ('port-' + uuidutils.generate_uuid())[:8]
+        port_name = 'test_output_port_1'
         self._create_bridge()
         self._create_port(port_name)
         queue_num = 1
@@ -358,7 +341,7 @@ class BaseOVSTestCase(base.BaseSudoTestCase):
         self._check_value(expected, self._list_queues, queue_id)
 
     def test_update_minimum_bandwidth_queue_no_qos_no_queue(self):
-        port_name = ('port-' + uuidutils.generate_uuid())[:8]
+        port_name = 'test_output_port_2'
         self._create_bridge()
         self._create_port(port_name)
         queue_num = 1
@@ -454,54 +437,3 @@ class BaseOVSTestCase(base.BaseSudoTestCase):
         self.assertEqual(8000,
                          self.ovs.db_get_val('Controller', self.br_name,
                                              'inactivity_probe'))
-
-    def test_add_gre_tunnel_port(self):
-        ipv4_tunnel_port = "test-ipv4-port"
-        ipv6_tunnel_port = "test-ipv6-port"
-        self._create_bridge()
-        self.ovs.add_tunnel_port(
-            ipv4_tunnel_port, "10.0.0.1", "10.0.0.2",
-            tunnel_type=p_const.TYPE_GRE)
-        self.ovs.add_tunnel_port(
-            ipv6_tunnel_port, "2001:db8::1", "2001:db8:2",
-            tunnel_type=p_const.TYPE_GRE)
-        interfaces = self.ovs.get_ports_attributes(
-            "Interface", columns=["name", "type", "options"],
-            if_exists=True)
-
-        ipv4_port_type = None
-        ipv6_port_type = None
-        ipv6_port_options = {}
-        for interface in interfaces:
-            if interface['name'] == ipv4_tunnel_port:
-                ipv4_port_type = interface['type']
-            elif interface['name'] == ipv6_tunnel_port:
-                ipv6_port_type = interface['type']
-                ipv6_port_options = interface['options']
-        self.assertEqual(p_const.TYPE_GRE, ipv4_port_type)
-        self.assertEqual(ovs_lib.TYPE_GRE_IP6, ipv6_port_type)
-        self.assertEqual('legacy_l2', ipv6_port_options.get('packet_type'))
-
-    def test_set_igmp_snooping_flood(self):
-        port_name = 'test_output_port_2'
-        self._create_bridge()
-        self._create_port(port_name)
-        self.ovs.set_igmp_snooping_flood(port_name, True)
-        ports_other_config = self.ovs.db_get_val('Port', port_name,
-                                                 'other_config')
-        self.assertEqual(
-            'true',
-            ports_other_config.get('mcast-snooping-flood', '').lower())
-        self.assertEqual(
-            'true',
-            ports_other_config.get('mcast-snooping-flood-reports', '').lower())
-
-        self.ovs.set_igmp_snooping_flood(port_name, False)
-        ports_other_config = self.ovs.db_get_val('Port', port_name,
-                                                 'other_config')
-        self.assertEqual(
-            'false',
-            ports_other_config.get('mcast-snooping-flood', '').lower())
-        self.assertEqual(
-            'false',
-            ports_other_config.get('mcast-snooping-flood-reports', '').lower())

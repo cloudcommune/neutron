@@ -20,7 +20,6 @@ import tempfile
 import netaddr
 from neutron_lib import constants as n_consts
 from neutron_lib import exceptions
-from neutron_lib.utils import helpers
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import uuidutils
@@ -30,11 +29,11 @@ from neutron.agent.l3 import ha_router
 from neutron.agent.l3 import namespaces
 from neutron.agent.linux import external_process
 from neutron.agent.linux import ip_lib
+from neutron.agent.linux import ip_link_support
 from neutron.agent.linux import keepalived
 from neutron.agent.linux import utils as agent_utils
 from neutron.cmd import runtime_checks
 from neutron.common import utils as common_utils
-from neutron.conf.agent.l3 import config as l3_config
 from neutron.plugins.ml2.drivers.openvswitch.agent.common \
     import constants as ovs_const
 
@@ -43,32 +42,21 @@ LOG = logging.getLogger(__name__)
 
 MINIMUM_DNSMASQ_VERSION = 2.67
 DNSMASQ_VERSION_DHCP_RELEASE6 = 2.76
-DNSMASQ_VERSION_HOST_ADDR6_LIST = 2.81
 MINIMUM_DIBBLER_VERSION = '1.0.1'
 CONNTRACK_GRE_MODULE = 'nf_conntrack_proto_gre'
 
 
 def ovs_vxlan_supported(from_ip='192.0.2.1', to_ip='192.0.2.2'):
-    br_name = common_utils.get_rand_device_name(prefix='vxlantest-')
-    port_name = common_utils.get_rand_device_name(prefix='vxlantest-')
-    with ovs_lib.OVSBridge(br_name) as br:
-        port = br.add_tunnel_port(
-            port_name=port_name,
-            remote_ip=from_ip,
-            local_ip=to_ip,
-            tunnel_type=n_consts.TYPE_VXLAN)
+    name = common_utils.get_rand_device_name(prefix='vxlantest-')
+    with ovs_lib.OVSBridge(name) as br:
+        port = br.add_tunnel_port(from_ip, to_ip, n_consts.TYPE_VXLAN)
         return port != ovs_lib.INVALID_OFPORT
 
 
 def ovs_geneve_supported(from_ip='192.0.2.3', to_ip='192.0.2.4'):
-    br_name = common_utils.get_rand_device_name(prefix='genevetest-')
-    port_name = common_utils.get_rand_device_name(prefix='genevetest-')
-    with ovs_lib.OVSBridge(br_name) as br:
-        port = br.add_tunnel_port(
-            port_name=port_name,
-            remote_ip=from_ip,
-            local_ip=to_ip,
-            tunnel_type=n_consts.TYPE_GENEVE)
+    name = common_utils.get_rand_device_name(prefix='genevetest-')
+    with ovs_lib.OVSBridge(name) as br:
+        port = br.add_tunnel_port(from_ip, to_ip, n_consts.TYPE_GENEVE)
         return port != ovs_lib.INVALID_OFPORT
 
 
@@ -157,6 +145,41 @@ def icmpv6_header_match_supported():
                                actions="NORMAL")
 
 
+def _vf_management_support(required_caps):
+    is_supported = True
+    try:
+        vf_section = ip_link_support.IpLinkSupport.get_vf_mgmt_section()
+        for cap in required_caps:
+            if not ip_link_support.IpLinkSupport.vf_mgmt_capability_supported(
+                   vf_section, cap):
+                is_supported = False
+                LOG.debug("ip link command does not support "
+                          "vf capability '%(cap)s'", {'cap': cap})
+    except ip_link_support.UnsupportedIpLinkCommand:
+        LOG.exception("Unexpected exception while checking supported "
+                      "ip link command")
+        return False
+    return is_supported
+
+
+def vf_management_supported():
+    required_caps = (
+        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_STATE,
+        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_SPOOFCHK,
+        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_RATE)
+    return _vf_management_support(required_caps)
+
+
+def vf_extended_management_supported():
+    required_caps = (
+        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_STATE,
+        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_SPOOFCHK,
+        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_RATE,
+        ip_link_support.IpLinkConstants.IP_LINK_CAPABILITY_MIN_TX_RATE,
+    )
+    return _vf_management_support(required_caps)
+
+
 def netns_read_requires_helper():
     nsname = "netnsreadtest-" + uuidutils.generate_uuid()
     ip_lib.create_network_namespace(nsname)
@@ -174,10 +197,6 @@ def get_minimal_dnsmasq_version_supported():
 
 def get_dnsmasq_version_with_dhcp_release6():
     return DNSMASQ_VERSION_DHCP_RELEASE6
-
-
-def get_dnsmasq_version_with_host_addr6_list():
-    return DNSMASQ_VERSION_HOST_ADDR6_LIST
 
 
 def dnsmasq_local_service_supported():
@@ -204,17 +223,6 @@ def dnsmasq_version_supported():
         ver = float(m.group(1)) if m else 0
         if ver < MINIMUM_DNSMASQ_VERSION:
             return False
-        if (cfg.CONF.dnsmasq_enable_addr6_list is True and
-                ver < DNSMASQ_VERSION_HOST_ADDR6_LIST):
-            LOG.warning('Support for multiple IPv6 addresses in host '
-                        'entries was introduced in dnsmasq version '
-                        '%(required)s. Found dnsmasq version %(current)s, '
-                        'which does not support this feature. Unless support '
-                        'for multiple IPv6 addresses was backported to the '
-                        'running build of dnsmasq, the configuration option '
-                        'dnsmasq_enable_addr6_list should be set to False.',
-                        {'required': DNSMASQ_VERSION_HOST_ADDR6_LIST,
-                         'current': ver})
     except (OSError, RuntimeError, IndexError, ValueError) as e:
         LOG.debug("Exception while checking minimal dnsmasq version. "
                   "Exception: %s", e)
@@ -243,7 +251,6 @@ def bridge_firewalling_enabled():
 
 class KeepalivedIPv6Test(object):
     def __init__(self, ha_port, gw_port, gw_vip, default_gw):
-        l3_config.register_l3_agent_config_opts(l3_config.OPTS, cfg.CONF)
         self.ha_port = ha_port
         self.gw_port = gw_port
         self.gw_vip = gw_vip
@@ -488,36 +495,3 @@ def gre_conntrack_supported():
         return agent_utils.execute(cmd, log_fail_as_error=False)
     except exceptions.ProcessExecutionError:
         return False
-
-
-def min_tx_rate_support():
-    device_mappings = helpers.parse_mappings(
-        cfg.CONF.SRIOV_NIC.physical_device_mappings, unique_keys=False)
-    devices_to_test = set()
-    for devices_in_physnet in device_mappings.values():
-        for device in devices_in_physnet:
-            devices_to_test.add(device)
-
-    # NOTE(ralonsoh): the VF used by default is 0. Each SR-IOV configured
-    # NIC should have configured at least 1 VF.
-    VF_NUM = 0
-    devices_without_support = set()
-    for device in devices_to_test:
-        try:
-            ip_link = ip_lib.IpLinkCommand(device)
-            # NOTE(ralonsoh): to set min_tx_rate, first is needed to set
-            # max_tx_rate and max_tx_rate >= min_tx_rate.
-            vf_config = {'vf': VF_NUM, 'rate': {'min_tx_rate': int(400),
-                                                'max_tx_rate': int(500)}}
-            ip_link.set_vf_feature(vf_config)
-            vf_config = {'vf': VF_NUM, 'rate': {'min_tx_rate': 0,
-                                                'max_tx_rate': 0}}
-            ip_link.set_vf_feature(vf_config)
-        except ip_lib.InvalidArgument:
-            devices_without_support.add(device)
-
-    if devices_without_support:
-        LOG.debug('The following NICs do not support "min_tx_rate": %s',
-                  devices_without_support)
-        return False
-    return True

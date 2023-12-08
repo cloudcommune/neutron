@@ -14,10 +14,8 @@
 import collections
 
 import netaddr
-from neutron_lib.api.definitions import external_net as extnet_apidef
 from neutron_lib.api.definitions import l3 as l3_apidef
 from neutron_lib.api.definitions import portbindings
-from neutron_lib.api.definitions import portbindings_extended
 from neutron_lib.api import validators
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import exceptions
@@ -68,18 +66,6 @@ def is_admin_state_down_necessary():
             _admin_state_down_before_update_lib.ALIAS in (extensions.
                     PluginAwareExtensionManager.get_instance().extensions)
     return _IS_ADMIN_STATE_DOWN_NECESSARY
-
-
-# TODO(slaweq): this should be moved to neutron_lib.plugins.utils module
-def is_port_bound(port):
-    active_binding = plugin_utils.get_port_binding_by_status_and_host(
-        port.get("port_bindings", []), const.ACTIVE)
-    if not active_binding:
-        LOG.warning("Binding for port %s was not found.", port)
-        return False
-    return active_binding[portbindings_extended.VIF_TYPE] not in [
-        portbindings.VIF_TYPE_UNBOUND,
-        portbindings.VIF_TYPE_BINDING_FAILED]
 
 
 @registry.has_registry_receivers
@@ -389,15 +375,6 @@ class DVRResourceOperationHandler(object):
                 self._core_plugin.ipam.delete_port(context, p['id'])
                 if host_id:
                     return
-
-    @registry.receives(resources.NETWORK, [events.AFTER_DELETE])
-    def delete_fip_namespaces_for_ext_net(self, rtype, event, trigger,
-                                          context, network, **kwargs):
-        if network.get(extnet_apidef.EXTERNAL):
-            # Send the information to all the L3 Agent hosts
-            # to clean up the fip namespace as it is no longer required.
-            self.l3plugin.l3_rpc_notifier.delete_fipnamespace_for_ext_net(
-                context, network['id'])
 
     def _get_ports_for_allowed_address_pair_ip(self, context, network_id,
                                                fixed_ip):
@@ -1295,11 +1272,10 @@ class L3_NAT_with_dvr_db_mixin(_DVRAgentInterfaceMixin,
 
     def get_ports_under_dvr_connected_subnet(self, context, subnet_id):
         query = dvr_mac_db.get_ports_query_by_subnet_and_ip(context, subnet_id)
-        ports = [p for p in query.all() if is_port_bound(p)]
         return [
             self.l3plugin._core_plugin._make_port_dict(
                 port, process_extensions=False)
-            for port in ports
+            for port in query.all()
         ]
 
 

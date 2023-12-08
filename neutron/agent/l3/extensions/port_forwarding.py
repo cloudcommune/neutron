@@ -72,11 +72,11 @@ class RouterFipPortForwardingMapping(object):
             if not self.managed_port_forwardings.get(port_forwarding.id):
                 continue
             self.managed_port_forwardings.pop(port_forwarding.id)
-            self.fip_port_forwarding[port_forwarding.floatingip_id].discard(
+            self.fip_port_forwarding[port_forwarding.floatingip_id].remove(
                 port_forwarding.id)
             if not self.fip_port_forwarding[port_forwarding.floatingip_id]:
                 self.fip_port_forwarding.pop(port_forwarding.floatingip_id)
-                self.router_fip_mapping[port_forwarding.router_id].discard(
+                self.router_fip_mapping[port_forwarding.router_id].remove(
                     port_forwarding.floatingip_id)
                 if not self.router_fip_mapping[port_forwarding.router_id]:
                     del self.router_fip_mapping[port_forwarding.router_id]
@@ -88,7 +88,7 @@ class RouterFipPortForwardingMapping(object):
 
     @lockutils.synchronized('port-forwarding-cache')
     def clear_by_fip(self, fip_id, router_id):
-        self.router_fip_mapping[router_id].discard(fip_id)
+        self.router_fip_mapping[router_id].remove(fip_id)
         if len(self.router_fip_mapping[router_id]) == 0:
             del self.router_fip_mapping[router_id]
         for pf_id in self.fip_port_forwarding[fip_id]:
@@ -99,14 +99,6 @@ class RouterFipPortForwardingMapping(object):
     def check_port_forwarding_changes(self, new_pf):
         old_pf = self.managed_port_forwardings.get(new_pf.id)
         return old_pf != new_pf
-
-    @lockutils.synchronized('port-forwarding-cache')
-    def clean_port_forwardings_by_router_id(self, router_id):
-        router_fips = self.router_fip_mapping.pop(router_id, [])
-        for fip_id in router_fips:
-            pf_ids = self.fip_port_forwarding.pop(fip_id, [])
-            for pf_id in pf_ids:
-                self.managed_port_forwardings.pop(pf_id, None)
 
 
 class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
@@ -177,7 +169,7 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
                 iptables_manager.ipv4['nat'].add_chain(chain)
             iptables_manager.ipv4['nat'].add_rule(chain, rule, tag=rule_tag)
 
-    @coordination.synchronized('router-lock-ns-{namespace}')
+    @coordination.synchronized('port-forwarding-{namespace}')
     def _process_create(self, port_forwardings, ri, interface_name, namespace,
                         iptables_manager):
         if not port_forwardings:
@@ -309,7 +301,7 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
                 context, [port_forwarding], ri, interface_name, namespace,
                 iptables_manager)
 
-    @coordination.synchronized('router-lock-ns-{namespace}')
+    @coordination.synchronized('port-forwarding-{namespace}')
     def _process_update(self, port_forwardings, iptables_manager,
                         interface_name, namespace):
         if not port_forwardings:
@@ -334,7 +326,7 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
         iptables_manager.apply()
         self._store_local(port_forwardings, events.UPDATED)
 
-    @coordination.synchronized('router-lock-ns-{namespace}')
+    @coordination.synchronized('port-forwarding-{namespace}')
     def _process_delete(self, context, port_forwardings, ri, interface_name,
                         namespace, iptables_manager):
         if not port_forwardings:
@@ -466,7 +458,7 @@ class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
         :param context: RPC context.
         :param data: Router data.
         """
-        self.mapping.clean_port_forwardings_by_router_id(data['id'])
+        pass
 
     def ha_state_change(self, context, data):
         pass

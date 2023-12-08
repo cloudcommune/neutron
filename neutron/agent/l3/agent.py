@@ -26,6 +26,7 @@ from neutron_lib import constants as lib_const
 from neutron_lib import context as n_context
 from neutron_lib.exceptions import l3 as l3_exc
 from neutron_lib import rpc as n_rpc
+from neutron_lib.utils import helpers
 from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_context import context as common_context
@@ -38,6 +39,7 @@ from oslo_utils import excutils
 from oslo_utils import timeutils
 from osprofiler import profiler
 
+from neutron._i18n import _
 from neutron.agent.common import resource_processing_queue as queue
 from neutron.agent.common import utils as common_utils
 from neutron.agent.l3 import dvr
@@ -442,6 +444,7 @@ class L3NATAgent(ha.AgentMixin,
 
         if router.get('ha'):
             features.append('ha')
+            kwargs['state_change_callback'] = self.enqueue_state_change
 
         if router.get('distributed') and router.get('ha'):
             # Case 1: If the router contains information about the HA interface
@@ -456,6 +459,7 @@ class L3NATAgent(ha.AgentMixin,
             if (not router.get(lib_const.HA_INTERFACE_KEY) or
                     self.conf.agent_mode != lib_const.L3_AGENT_MODE_DVR_SNAT):
                 features.remove('ha')
+                kwargs.pop('state_change_callback')
 
         return self.router_factory.create(features, **kwargs)
 
@@ -611,28 +615,13 @@ class L3NATAgent(ha.AgentMixin,
         ri = self.router_info[router['id']]
         ri.router = router
         ri.process()
+        ex_gw_port = ri.get_ex_gw_port()
+        self.process_router_portforwardings(ri, ex_gw_port)
         registry.notify(resources.ROUTER, events.AFTER_CREATE, self, router=ri)
         self.l3_ext_manager.add_router(self.context, router)
 
     def _process_updated_router(self, router):
         ri = self.router_info[router['id']]
-
-        router_ha = router.get('ha')
-        router_distributed = router.get('distributed')
-        if ((router_ha is not None and ri.router.get('ha') != router_ha) or
-                (router_distributed is not None and
-                 ri.router.get('distributed') != router_distributed)):
-            LOG.warning('Type of the router %(id)s changed. '
-                        'Old type: ha=%(old_ha)s; distributed=%(old_dvr)s; '
-                        'New type: ha=%(new_ha)s; distributed=%(new_dvr)s',
-                        {'id': router['id'],
-                         'old_ha': ri.router.get('ha'),
-                         'old_dvr': ri.router.get('distributed'),
-                         'new_ha': router.get('ha'),
-                         'new_dvr': router.get('distributed')})
-            ri = self._create_router(router['id'], router)
-            self.router_info[router['id']] = ri
-
         is_dvr_snat_agent = (self.conf.agent_mode ==
                              lib_const.L3_AGENT_MODE_DVR_SNAT)
         is_dvr_only_agent = (self.conf.agent_mode in
@@ -663,6 +652,8 @@ class L3NATAgent(ha.AgentMixin,
             registry.notify(resources.ROUTER, events.BEFORE_UPDATE,
                             self, router=ri)
             ri.process()
+            ex_gw_port = ri.get_ex_gw_port()
+            self.process_router_portforwardings(ri, ex_gw_port)
             registry.notify(
                 resources.ROUTER, events.AFTER_UPDATE, self, router=ri)
             self.l3_ext_manager.update_router(self.context, router)
@@ -673,6 +664,9 @@ class L3NATAgent(ha.AgentMixin,
         if router_update.hit_retry_limit():
             LOG.warning("Hit retry limit with router update for %s, action %s",
                         router_update.id, router_update.action)
+            if router_update.action != DELETE_ROUTER:
+                LOG.debug("Deleting router %s", router_update.id)
+                self._safe_router_removed(router_update.id)
             return
         router_update.timestamp = timeutils.utcnow()
         router_update.priority = priority
@@ -912,6 +906,74 @@ class L3NATAgent(ha.AgentMixin,
                                       action=PD_UPDATE)
         self._queue.add(update)
 
+    # port forwarding
+    def _update_portforwardings(self, ri, operation, portfwd):
+        """Configure the router's port forwarding rules."""
+        # chain_in, chain_out = "PREROUTING", "snat"
+        chain_in = "PREROUTING"
+        # rule_in = ("-p %(protocol)s"
+        #            " -d %(outside_addr)s --dport %(outside_port)s"
+        #            " -j DNAT --to %(inside_addr)s:%(inside_port)s"
+        #            % portfwd)
+        rule_in = ("-d %(outside_addr)s/32 -p %(protocol)s"
+                   " -m  %(protocol)s --dport %(outside_port)s"
+                   " -j DNAT --to-destination %(inside_addr)s:%(inside_port)s"
+                   % portfwd)
+        # rule_out = ("-p %(protocol)s"
+        #   " -s %(inside_addr)s --sport %(inside_port)s"
+        #   " -j SNAT --to %(outside_addr)s:%(outside_port)s"
+        #   % portfwd)
+        if operation == 'create':
+            LOG.debug("Added portforwarding rule_in is %s", rule_in)
+            ri.iptables_manager.ipv4['nat'].add_rule(chain_in, rule_in,
+                                                     tag='portforwarding')
+        # note: SNAT rule are not necessary for portforwarding
+        # LOG.debug(_("Added portforwarding rule_out is '%s'"), rule_out)
+        # ri.iptables_manager.ipv4['nat'].add_rule(chain_out, rule_out,
+        #                   top=True,
+        #                   tag='portforwarding')
+        elif operation == 'delete':
+            LOG.debug("Removed portforwarding rule_in is %s", rule_in)
+            ri.iptables_manager.ipv4['nat'].remove_rule(chain_in, rule_in)
+            # note: SNAT rule are not necessary for portforwarding
+            # LOG.debug(_("Removed portforwarding rule_out is '%s'"), rule_out)
+            # ri.iptables_manager.ipv4['nat'].remove_rule(chain_out, rule_out)
+        else:
+            raise Exception(_('should never be here'))
+
+    def process_router_portforwardings(self, ri, ex_gw_port):
+        if 'portforwardings' not in ri.router:
+            # note(jianingy): return when portforwarding extension
+            # is not enabled
+            LOG.debug("Portforwarding Extension Not Enabled")
+            return None
+        if ex_gw_port:
+            new_portfwds = ri.router['portforwardings']
+            for new_portfwd in new_portfwds:
+                new_portfwd['outside_addr'] = (
+                    ex_gw_port.get('fixed_ips')[0].get('ip_address'))
+                LOG.debug("New Portforwarding: %s", new_portfwd.values())
+            old_portfwds = ri.portforwardings
+            for old_portfwd in old_portfwds:
+                LOG.debug("Old Portforwarding: %s", old_portfwd.values())
+            adds, removes = helpers.diff_list_of_dict(old_portfwds,
+                                                      new_portfwds)
+            for portfwd in adds:
+                LOG.debug("Add Portforwarding: %s", portfwd.values())
+                self._update_portforwardings(ri, 'create', portfwd)
+            for portfwd in removes:
+                LOG.debug("Del Portforwarding: %s", portfwd.values())
+                self._update_portforwardings(ri, 'delete', portfwd)
+            ri.portforwardings = new_portfwds
+        else:
+            old_portfwds = ri.portforwardings
+            for old_portfwd in old_portfwds:
+                LOG.debug("Del Portforwarding: %s", old_portfwd.values())
+                self._update_portforwardings(ri, 'delete', old_portfwd)
+            ri.portforwardings = []
+
+        ri.iptables_manager.apply()
+
 
 class L3NATAgentWithStateReport(L3NATAgent):
 
@@ -929,8 +991,7 @@ class L3NATAgentWithStateReport(L3NATAgent):
                 'handle_internal_only_routers':
                 self.conf.handle_internal_only_routers,
                 'interface_driver': self.conf.interface_driver,
-                'log_agent_heartbeats': self.conf.AGENT.log_agent_heartbeats,
-                'extensions': self.l3_ext_manager.names()},
+                'log_agent_heartbeats': self.conf.AGENT.log_agent_heartbeats},
             'start_flag': True,
             'agent_type': lib_const.AGENT_TYPE_L3}
         report_interval = self.conf.AGENT.report_interval

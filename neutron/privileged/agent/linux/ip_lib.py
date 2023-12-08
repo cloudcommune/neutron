@@ -10,8 +10,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import ctypes
-from ctypes import util as ctypes_util
 import errno
 import functools
 import os
@@ -19,7 +17,6 @@ import socket
 
 from neutron_lib import constants
 from oslo_concurrency import lockutils
-from oslo_log import log as logging
 import pyroute2
 from pyroute2 import netlink
 from pyroute2.netlink import exceptions as netlink_exceptions
@@ -34,26 +31,9 @@ from neutron._i18n import _
 from neutron import privileged
 
 
-LOG = logging.getLogger(__name__)
-
 _IP_VERSION_FAMILY_MAP = {4: socket.AF_INET, 6: socket.AF_INET6}
 
 NETNS_RUN_DIR = '/var/run/netns'
-
-_CDLL = None
-
-
-def _get_cdll():
-    global _CDLL
-    if not _CDLL:
-        # NOTE(ralonsoh): from https://docs.python.org/3.6/library/
-        # ctypes.html#ctypes.PyDLL: "Instances of this class behave like CDLL
-        # instances, except that the Python GIL is not released during the
-        # function call, and after the function execution the Python error
-        # flag is checked."
-        # Check https://bugs.launchpad.net/neutron/+bug/1870352
-        _CDLL = ctypes.PyDLL(ctypes_util.find_library('c'), use_errno=True)
-    return _CDLL
 
 
 @lockutils.synchronized("privileged-ip-lib")
@@ -86,8 +66,6 @@ def _get_scope_name(scope):
     return rtnl.rt_scope.get(scope, scope)
 
 
-# TODO(ralonsoh): move those exceptions out of priv_ip_lib to avoid other
-# modules to import this one.
 class NetworkNamespaceNotFound(RuntimeError):
     message = _("Network namespace %(netns_name)s could not be found.")
 
@@ -124,21 +102,6 @@ class InterfaceOperationNotSupported(RuntimeError):
         message = message or self.message % {
                 'device': device, 'namespace': namespace}
         super(InterfaceOperationNotSupported, self).__init__(message)
-
-
-class InvalidArgument(RuntimeError):
-    message = _("Invalid parameter/value used on interface %(device)s, "
-                "namespace %(namespace)s.")
-
-    def __init__(self, message=None, device=None, namespace=None):
-        # NOTE(slaweq): 'message' can be passed as an optional argument
-        # because of how privsep daemon works. If exception is raised in
-        # function called by privsep daemon, it will then try to reraise it
-        # and will call it always with passing only message from originally
-        # raised exception.
-        message = message or self.message % {'device': device,
-                                             'namespace': namespace}
-        super(InvalidArgument, self).__init__(message)
 
 
 class IpAddressAlreadyExists(RuntimeError):
@@ -275,21 +238,14 @@ def _translate_ip_device_exception(e, device=None, namespace=None):
     if e.code == errno.EOPNOTSUPP:
         raise InterfaceOperationNotSupported(device=device,
                                              namespace=namespace)
-    if e.code == errno.EINVAL:
-        raise InvalidArgument(device=device, namespace=namespace)
 
 
-def get_link_id(device, namespace, raise_exception=True):
-    with get_iproute(namespace) as ip:
-        link_id = ip.link_lookup(ifname=device)
-    if not link_id or len(link_id) < 1:
-        if raise_exception:
-            raise NetworkInterfaceNotFound(device=device, namespace=namespace)
-        else:
-            LOG.debug('Interface %(dev)s not found in namespace %(namespace)s',
-                      {'dev': device, 'namespace': namespace})
-            return None
-    return link_id[0]
+def get_link_id(device, namespace):
+    try:
+        with get_iproute(namespace) as ip:
+            return ip.link_lookup(ifname=device)[0]
+    except IndexError:
+        raise NetworkInterfaceNotFound(device=device, namespace=namespace)
 
 
 def _run_iproute_link(command, device, namespace=None, **kwargs):
@@ -335,6 +291,11 @@ def _run_iproute_addr(command, device, namespace, **kwargs):
 
 
 @_sync
+@privileged.default.entrypoint
+def privileged_get_link_id(device, namespace):
+    return get_link_id(device, namespace)
+
+
 @privileged.default.entrypoint
 def add_ip_address(ip_version, ip, prefixlen, device, namespace, scope,
                    broadcast=None):
@@ -420,8 +381,10 @@ def delete_interface(ifname, namespace, **kwargs):
 @privileged.default.entrypoint
 def interface_exists(ifname, namespace):
     try:
-        idx = get_link_id(ifname, namespace, raise_exception=False)
+        idx = get_link_id(ifname, namespace)
         return bool(idx)
+    except NetworkInterfaceNotFound:
+        return False
     except OSError as e:
         if e.errno == errno.ENOENT:
             return False
@@ -444,11 +407,6 @@ def set_link_attribute(device, namespace, **attributes):
 
 @_sync
 @privileged.default.entrypoint
-def set_link_vf_feature(device, namespace, vf_config):
-    return _run_iproute_link("set", device, namespace=namespace, vf=vf_config)
-
-
-@privileged.default.entrypoint
 def get_link_attributes(device, namespace):
     link = _run_iproute_link("get", device, namespace)[0]
     return {
@@ -465,24 +423,6 @@ def get_link_attributes(device, namespace):
 
 
 @_sync
-@privileged.default.entrypoint
-def get_link_vfs(device, namespace):
-    link = _run_iproute_link('get', device, namespace=namespace, ext_mask=1)[0]
-    num_vfs = link.get_attr('IFLA_NUM_VF')
-    vfs = {}
-    if not num_vfs:
-        return vfs
-
-    vfinfo_list = link.get_attr('IFLA_VFINFO_LIST')
-    for vinfo in vfinfo_list.get_attrs('IFLA_VF_INFO'):
-        mac = vinfo.get_attr('IFLA_VF_MAC')
-        link_state = vinfo.get_attr('IFLA_VF_LINK_STATE')
-        vfs[mac['vf']] = {'mac': mac['mac'],
-                          'link_state': link_state['link_state']}
-
-    return vfs
-
-
 @privileged.default.entrypoint
 def add_neigh_entry(ip_version, ip_address, mac_address, device, namespace,
                     **kwargs):
@@ -568,7 +508,7 @@ def create_netns(name, **kwargs):
     :param name: The name of the namespace to create
     """
     try:
-        netns.create(name, libc=_get_cdll())
+        netns.create(name, **kwargs)
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
@@ -581,7 +521,7 @@ def remove_netns(name, **kwargs):
     :param name: The name of the namespace to remove
     """
     try:
-        netns.remove(name, libc=_get_cdll())
+        netns.remove(name, **kwargs)
     except OSError as e:
         if e.errno != errno.ENOENT:
             raise
@@ -611,7 +551,7 @@ def make_serializable(value):
     if isinstance(value, list):
         return [make_serializable(item) for item in value]
     elif isinstance(value, netlink.nla_slot):
-        return [_ensure_string(value[0]), make_serializable(value[1])]
+        return [value[0], make_serializable(value[1])]
     elif isinstance(value, netlink.nla_base) and six.PY3:
         return make_serializable(value.dump())
     elif isinstance(value, dict):
@@ -728,7 +668,8 @@ def _make_pyroute2_route_args(namespace, ip_version, cidr, device, via, table,
     :param ip_version: (int) [4, 6]
     :param cidr: (string) source IP or CIDR address (IPv4, IPv6)
     :param device: (string) input interface name
-    :param via: (string) gateway IP address
+    :param via: (string) gateway IP address or (list of dicts) for multipath
+                definition.
     :param table: (string, int) table number or name
     :param metric: (int) route metric
     :param scope: (int) route scope
@@ -743,16 +684,29 @@ def _make_pyroute2_route_args(namespace, ip_version, cidr, device, via, table,
         args['scope'] = scope
     if cidr:
         args['dst'] = cidr
-    if device:
-        args['oif'] = get_link_id(device, namespace)
-    if via:
-        args['gateway'] = via
     if table:
         args['table'] = int(table)
     if metric:
         args['priority'] = int(metric)
     if protocol:
         args['proto'] = protocol
+    if isinstance(via, (list, tuple)):
+        args['multipath'] = []
+        for mp in via:
+            multipath = {}
+            if mp.get('device'):
+                multipath['oif'] = get_link_id(mp['device'], namespace)
+            if mp.get('via'):
+                multipath['gateway'] = mp['via']
+            if mp.get('weight'):
+                multipath['hops'] = mp['weight'] - 1
+            args['multipath'].append(multipath)
+    else:
+        if via:
+            args['gateway'] = via
+        if device:
+            args['oif'] = get_link_id(device, namespace)
+
     return args
 
 

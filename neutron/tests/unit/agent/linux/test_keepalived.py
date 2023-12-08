@@ -14,18 +14,13 @@
 #
 
 import os
-import signal
 import textwrap
 
 import mock
 from neutron_lib import constants as n_consts
-from oslo_config import cfg
-from oslo_utils import uuidutils
 import testtools
 
-from neutron.agent.linux import external_process
 from neutron.agent.linux import keepalived
-from neutron.conf.agent.l3 import config as l3_config
 from neutron.tests import base
 
 # Keepalived user guide:
@@ -42,14 +37,7 @@ VRRP_ID = 1
 VRRP_INTERVAL = 5
 
 
-class KeepalivedBaseTestCase(base.BaseTestCase):
-
-    def setUp(self):
-        super(KeepalivedBaseTestCase, self).setUp()
-        l3_config.register_l3_agent_config_opts(l3_config.OPTS, cfg.CONF)
-
-
-class KeepalivedGetFreeRangeTestCase(KeepalivedBaseTestCase):
+class KeepalivedGetFreeRangeTestCase(base.BaseTestCase):
     def test_get_free_range(self):
         free_range = keepalived.get_free_range(
             parent_range='169.254.0.0/16',
@@ -95,16 +83,16 @@ class KeepalivedConfBaseMixin(object):
         instance1.track_interfaces.append("eth0")
 
         vip_address1 = keepalived.KeepalivedVipAddress('192.168.1.0/24',
-                                                       'eth1', track=False)
+                                                       'eth1')
 
         vip_address2 = keepalived.KeepalivedVipAddress('192.168.2.0/24',
-                                                       'eth2', track=False)
+                                                       'eth2')
 
         vip_address3 = keepalived.KeepalivedVipAddress('192.168.3.0/24',
-                                                       'eth2', track=False)
+                                                       'eth2')
 
         vip_address_ex = keepalived.KeepalivedVipAddress('192.168.55.0/24',
-                                                         'eth10', track=False)
+                                                         'eth10')
 
         instance1.vips.append(vip_address1)
         instance1.vips.append(vip_address2)
@@ -122,7 +110,7 @@ class KeepalivedConfBaseMixin(object):
         instance2.track_interfaces.append("eth4")
 
         vip_address1 = keepalived.KeepalivedVipAddress('192.168.3.0/24',
-                                                       'eth6', track=False)
+                                                       'eth6')
 
         instance2.vips.append(vip_address1)
         instance2.vips.append(vip_address2)
@@ -134,76 +122,8 @@ class KeepalivedConfBaseMixin(object):
         return config
 
 
-class KeepalivedConfTestCase(KeepalivedBaseTestCase,
+class KeepalivedConfTestCase(base.BaseTestCase,
                              KeepalivedConfBaseMixin):
-
-    expected = KEEPALIVED_GLOBAL_CONFIG + textwrap.dedent("""
-        vrrp_instance VR_1 {
-            state MASTER
-            interface eth0
-            virtual_router_id 1
-            priority 50
-            garp_master_delay 60
-            advert_int 5
-            authentication {
-                auth_type AH
-                auth_pass pass123
-            }
-            track_interface {
-                eth0
-            }
-            virtual_ipaddress {
-                169.254.0.1/24 dev eth0
-            }
-            virtual_ipaddress_excluded {
-                192.168.1.0/24 dev eth1 no_track
-                192.168.2.0/24 dev eth2 no_track
-                192.168.3.0/24 dev eth2 no_track
-                192.168.55.0/24 dev eth10 no_track
-            }
-            virtual_routes {
-                0.0.0.0/0 via 192.168.1.1 dev eth1 no_track
-            }
-        }
-        vrrp_instance VR_2 {
-            state MASTER
-            interface eth4
-            virtual_router_id 2
-            priority 50
-            garp_master_delay 60
-            mcast_src_ip 224.0.0.1
-            track_interface {
-                eth4
-            }
-            virtual_ipaddress {
-                169.254.0.2/24 dev eth4
-            }
-            virtual_ipaddress_excluded {
-                192.168.2.0/24 dev eth2 no_track
-                192.168.3.0/24 dev eth6 no_track
-                192.168.55.0/24 dev eth10 no_track
-            }
-        }""")
-
-    def test_config_generation(self):
-        config = self._get_config()
-        self.assertEqual(self.expected, config.get_config_str())
-
-    def test_config_with_reset(self):
-        config = self._get_config()
-        self.assertEqual(self.expected, config.get_config_str())
-
-        config.reset()
-        self.assertEqual(KEEPALIVED_GLOBAL_CONFIG, config.get_config_str())
-
-    def test_get_existing_vip_ip_addresses_returns_list(self):
-        config = self._get_config()
-        instance = config.get_instance(1)
-        current_vips = sorted(instance.get_existing_vip_ip_addresses('eth2'))
-        self.assertEqual(['192.168.2.0/24', '192.168.3.0/24'], current_vips)
-
-
-class KeepalivedConfWithoutNoTrackTestCase(KeepalivedConfTestCase):
 
     expected = KEEPALIVED_GLOBAL_CONFIG + textwrap.dedent("""
         vrrp_instance VR_1 {
@@ -253,12 +173,25 @@ class KeepalivedConfWithoutNoTrackTestCase(KeepalivedConfTestCase):
             }
         }""")
 
-    def setUp(self):
-        super(KeepalivedConfWithoutNoTrackTestCase, self).setUp()
-        cfg.CONF.set_override('keepalived_use_no_track', False)
+    def test_config_generation(self):
+        config = self._get_config()
+        self.assertEqual(self.expected, config.get_config_str())
+
+    def test_config_with_reset(self):
+        config = self._get_config()
+        self.assertEqual(self.expected, config.get_config_str())
+
+        config.reset()
+        self.assertEqual(KEEPALIVED_GLOBAL_CONFIG, config.get_config_str())
+
+    def test_get_existing_vip_ip_addresses_returns_list(self):
+        config = self._get_config()
+        instance = config.get_instance(1)
+        current_vips = sorted(instance.get_existing_vip_ip_addresses('eth2'))
+        self.assertEqual(['192.168.2.0/24', '192.168.3.0/24'], current_vips)
 
 
-class KeepalivedStateExceptionTestCase(KeepalivedBaseTestCase):
+class KeepalivedStateExceptionTestCase(base.BaseTestCase):
     def test_state_exception(self):
         invalid_vrrp_state = 'a seal walks'
         self.assertRaises(keepalived.InvalidInstanceStateException,
@@ -274,7 +207,7 @@ class KeepalivedStateExceptionTestCase(KeepalivedBaseTestCase):
                           invalid_auth_type, 'some_password')
 
 
-class KeepalivedInstanceRoutesTestCase(KeepalivedBaseTestCase):
+class KeepalivedInstanceRoutesTestCase(base.BaseTestCase):
     @classmethod
     def _get_instance_routes(cls):
         routes = keepalived.KeepalivedInstanceRoutes()
@@ -306,36 +239,24 @@ class KeepalivedInstanceRoutesTestCase(KeepalivedBaseTestCase):
 
     def test_build_config(self):
         expected = """    virtual_routes {
-        0.0.0.0/0 via 1.0.0.254 dev eth0 no_track
-        ::/0 via fe80::3e97:eff:fe26:3bfa/64 dev eth1 no_track
-        10.0.0.0/8 via 1.0.0.1 no_track
-        20.0.0.0/8 via 2.0.0.2 no_track
-        30.0.0.0/8 dev eth0 scope link no_track
-    }"""
-        routes = self._get_instance_routes()
-        self.assertEqual(expected, '\n'.join(routes.build_config()))
-
-    def test_build_config_without_no_track_option(self):
-        expected = """    virtual_routes {
         0.0.0.0/0 via 1.0.0.254 dev eth0
         ::/0 via fe80::3e97:eff:fe26:3bfa/64 dev eth1
         10.0.0.0/8 via 1.0.0.1
         20.0.0.0/8 via 2.0.0.2
         30.0.0.0/8 dev eth0 scope link
     }"""
-        cfg.CONF.set_override('keepalived_use_no_track', False)
         routes = self._get_instance_routes()
         self.assertEqual(expected, '\n'.join(routes.build_config()))
 
 
-class KeepalivedInstanceTestCase(KeepalivedBaseTestCase,
+class KeepalivedInstanceTestCase(base.BaseTestCase,
                                  KeepalivedConfBaseMixin):
     def test_get_primary_vip(self):
         instance = keepalived.KeepalivedInstance('MASTER', 'ha0', 42,
                                                  ['169.254.192.0/18'])
         self.assertEqual('169.254.0.42/24', instance.get_primary_vip())
 
-    def _test_remove_addresses_by_interface(self, no_track_value):
+    def test_remove_addresses_by_interface(self):
         config = self._get_config()
         instance = config.get_instance(1)
         instance.remove_vips_vroutes_by_interface('eth2')
@@ -360,10 +281,10 @@ class KeepalivedInstanceTestCase(KeepalivedBaseTestCase,
                     169.254.0.1/24 dev eth0
                 }
                 virtual_ipaddress_excluded {
-                    192.168.1.0/24 dev eth1%(no_track)s
+                    192.168.1.0/24 dev eth1
                 }
                 virtual_routes {
-                    0.0.0.0/0 via 192.168.1.1 dev eth1%(no_track)s
+                    0.0.0.0/0 via 192.168.1.1 dev eth1
                 }
             }
             vrrp_instance VR_2 {
@@ -380,20 +301,13 @@ class KeepalivedInstanceTestCase(KeepalivedBaseTestCase,
                     169.254.0.2/24 dev eth4
                 }
                 virtual_ipaddress_excluded {
-                    192.168.2.0/24 dev eth2%(no_track)s
-                    192.168.3.0/24 dev eth6%(no_track)s
-                    192.168.55.0/24 dev eth10%(no_track)s
+                    192.168.2.0/24 dev eth2
+                    192.168.3.0/24 dev eth6
+                    192.168.55.0/24 dev eth10
                 }
-            }""" % {'no_track': no_track_value})
+            }""")
 
         self.assertEqual(expected, config.get_config_str())
-
-    def test_remove_addresses_by_interface(self):
-        self._test_remove_addresses_by_interface(" no_track")
-
-    def test_remove_addresses_by_interface_without_no_track(self):
-        cfg.CONF.set_override('keepalived_use_no_track', False)
-        self._test_remove_addresses_by_interface("")
 
     def test_build_config_no_vips(self):
         expected = textwrap.dedent("""\
@@ -437,7 +351,7 @@ vrrp_instance VR_1 {
         self.assertEqual(expected, '\n'.join(instance.build_config()))
 
 
-class KeepalivedVipAddressTestCase(KeepalivedBaseTestCase):
+class KeepalivedVipAddressTestCase(base.BaseTestCase):
     def test_vip_with_scope(self):
         vip = keepalived.KeepalivedVipAddress('fe80::3e97:eff:fe26:3bfa/64',
                                               'eth1',
@@ -453,15 +367,8 @@ class KeepalivedVipAddressTestCase(KeepalivedBaseTestCase):
         self.assertEqual(1, len(instance.vips))
 
 
-class KeepalivedVirtualRouteTestCase(KeepalivedBaseTestCase):
+class KeepalivedVirtualRouteTestCase(base.BaseTestCase):
     def test_virtual_route_with_dev(self):
-        route = keepalived.KeepalivedVirtualRoute(n_consts.IPv4_ANY, '1.2.3.4',
-                                                  'eth0')
-        self.assertEqual('0.0.0.0/0 via 1.2.3.4 dev eth0 no_track',
-                         route.build_config())
-
-    def test_virtual_route_with_dev_without_no_track(self):
-        cfg.CONF.set_override('keepalived_use_no_track', False)
         route = keepalived.KeepalivedVirtualRoute(n_consts.IPv4_ANY, '1.2.3.4',
                                                   'eth0')
         self.assertEqual('0.0.0.0/0 via 1.2.3.4 dev eth0',
@@ -469,16 +376,10 @@ class KeepalivedVirtualRouteTestCase(KeepalivedBaseTestCase):
 
     def test_virtual_route_without_dev(self):
         route = keepalived.KeepalivedVirtualRoute('50.0.0.0/8', '1.2.3.4')
-        self.assertEqual('50.0.0.0/8 via 1.2.3.4 no_track',
-                         route.build_config())
-
-    def test_virtual_route_without_dev_without_no_track(self):
-        cfg.CONF.set_override('keepalived_use_no_track', False)
-        route = keepalived.KeepalivedVirtualRoute('50.0.0.0/8', '1.2.3.4')
         self.assertEqual('50.0.0.0/8 via 1.2.3.4', route.build_config())
 
 
-class KeepalivedTrackScriptTestCase(KeepalivedBaseTestCase):
+class KeepalivedTrackScriptTestCase(base.BaseTestCase):
 
     def test_build_config_preamble(self):
         exp_conf = [
@@ -546,40 +447,3 @@ ping6 -c 1 -w 1 2001:db8::1 1>/dev/null || exit 1""",
         with mock.patch.object(keepalived, 'file_utils') as patched_utils:
             ts.write_check_script()
             patched_utils.replace_file.assert_not_called()
-
-
-class KeepalivedManagerTestCase(base.BaseTestCase):
-
-    def setUp(self):
-        super(KeepalivedManagerTestCase, self).setUp()
-        self.mock_config = mock.Mock()
-        self.mock_config.AGENT.check_child_processes_interval = False
-        self.process_monitor = external_process.ProcessMonitor(
-            self.mock_config, mock.ANY)
-        self.uuid = uuidutils.generate_uuid()
-        self.process_monitor.register(
-            self.uuid, keepalived.KEEPALIVED_SERVICE_NAME, mock.ANY)
-        self.keepalived_manager = keepalived.KeepalivedManager(
-            self.uuid, self.mock_config, self.process_monitor, mock.ANY)
-        self.mock_get_process = mock.patch.object(self.keepalived_manager,
-                                                  'get_process')
-
-    def test_destroy(self):
-        mock_get_process = self.mock_get_process.start()
-        process = mock.Mock()
-        mock_get_process.return_value = process
-        process.active = False
-        self.keepalived_manager.disable()
-        process.disable.assert_called_once_with(
-            sig=str(int(signal.SIGTERM)))
-
-    def test_destroy_force(self):
-        mock_get_process = self.mock_get_process.start()
-        with mock.patch.object(keepalived, 'SIGTERM_TIMEOUT', 0):
-            process = mock.Mock()
-            mock_get_process.return_value = process
-            process.active = True
-            self.keepalived_manager.disable()
-            process.disable.assert_has_calls([
-                mock.call(sig=str(int(signal.SIGTERM))),
-                mock.call(sig=str(int(signal.SIGKILL)))])

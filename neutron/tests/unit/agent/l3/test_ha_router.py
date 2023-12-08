@@ -40,7 +40,8 @@ class TestBasicRouterOperations(base.BaseTestCase):
             router = mock.MagicMock()
         self.agent_conf = mock.Mock()
         self.router_id = _uuid()
-        return ha_router.HaRouter(mock.sentinel.agent,
+        return ha_router.HaRouter(mock.sentinel.enqueue_state,
+                                  mock.sentinel.agent,
                                   self.router_id,
                                   router,
                                   self.agent_conf,
@@ -82,10 +83,6 @@ class TestBasicRouterOperations(base.BaseTestCase):
         subnets[1]['gateway_ip'] = None
         ri._add_default_gw_virtual_route(ex_gw_port, 'qg-abc')
         self.assertEqual(0, len(mock_instance.virtual_routes.gateway_routes))
-
-        subnets[1]['gateway_ip'] = '30.0.1.1'
-        ri._add_default_gw_virtual_route(ex_gw_port, 'qg-abc')
-        self.assertEqual(2, len(mock_instance.virtual_routes.gateway_routes))
 
     @mock.patch.object(router_info.RouterInfo, 'remove_floating_ip')
     def test_remove_floating_ip(self, super_remove_floating_ip):

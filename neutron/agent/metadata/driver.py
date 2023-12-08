@@ -13,10 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import errno
 import grp
 import os
 import pwd
-import signal
 
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
@@ -30,14 +30,9 @@ from neutron._i18n import _
 from neutron.agent.l3 import ha_router
 from neutron.agent.l3 import namespaces
 from neutron.agent.linux import external_process
-from neutron.agent.linux import utils as linux_utils
-from neutron.common import coordination
-from neutron.common import utils as common_utils
 
 
 LOG = logging.getLogger(__name__)
-
-SIGTERM_TIMEOUT = 5
 
 METADATA_SERVICE_NAME = 'metadata-proxy'
 HAPROXY_SERVICE = 'haproxy'
@@ -70,8 +65,7 @@ defaults
 listen listener
     bind %(host)s:%(port)s
     server metadata %(unix_socket_path)s
-    http-request del-header X-Neutron-%(res_type_del)s-ID
-    http-request set-header X-Neutron-%(res_type)s-ID %(res_id)s
+    http-request add-header X-Neutron-%(res_type)s-ID %(res_id)s
 """
 
 
@@ -134,16 +128,12 @@ class HaproxyConfigurator(object):
             'log_level': self.log_level,
             'log_tag': self.log_tag
         }
-        # If using the network ID, delete any spurious router ID that might
-        # have been in the request, same for network ID when using router ID.
         if self.network_id:
             cfg_info['res_type'] = 'Network'
             cfg_info['res_id'] = self.network_id
-            cfg_info['res_type_del'] = 'Router'
         else:
             cfg_info['res_type'] = 'Router'
             cfg_info['res_id'] = self.router_id
-            cfg_info['res_type_del'] = 'Network'
 
         haproxy_cfg = _HAPROXY_CONFIG_TEMPLATE % cfg_info
         LOG.debug("haproxy_cfg = %s", haproxy_cfg)
@@ -168,7 +158,13 @@ class HaproxyConfigurator(object):
         cfg_path = os.path.join(
             HaproxyConfigurator.get_config_path(state_path),
             "%s.conf" % uuid)
-        linux_utils.delete_if_exists(cfg_path, run_as_root=True)
+        try:
+            os.unlink(cfg_path)
+        except OSError as ex:
+            # It can happen that this function is called but metadata proxy
+            # was never spawned so its config file won't exist
+            if ex.errno != errno.ENOENT:
+                raise
 
 
 class MetadataDriver(object):
@@ -251,19 +247,10 @@ class MetadataDriver(object):
         monitor.unregister(uuid, METADATA_SERVICE_NAME)
         pm = cls._get_metadata_proxy_process_manager(uuid, conf,
                                                      ns_name=ns_name)
-        pm.disable(sig=str(int(signal.SIGTERM)))
-        try:
-            common_utils.wait_until_true(lambda: not pm.active,
-                                         timeout=SIGTERM_TIMEOUT)
-        except common_utils.WaitTimeout:
-            LOG.warning('Metadata process %s did not finish after SIGTERM '
-                        'signal in %s seconds, sending SIGKILL signal',
-                        pm.pid, SIGTERM_TIMEOUT)
-            pm.disable(sig=str(int(signal.SIGKILL)))
+        pm.disable()
 
-        # Delete metadata proxy config and PID files.
+        # Delete metadata proxy config file
         HaproxyConfigurator.cleanup_config_file(uuid, cfg.CONF.state_path)
-        linux_utils.delete_if_exists(pm.get_pid_file_name(), run_as_root=True)
 
         cls.monitors.pop(uuid, None)
 
@@ -281,7 +268,13 @@ class MetadataDriver(object):
 def after_router_added(resource, event, l3_agent, **kwargs):
     router = kwargs['router']
     proxy = l3_agent.metadata_driver
-    apply_metadata_nat_rules(router, proxy)
+    for c, r in proxy.metadata_filter_rules(proxy.metadata_port,
+                                            proxy.metadata_access_mark):
+        router.iptables_manager.ipv4['filter'].add_rule(c, r)
+    for c, r in proxy.metadata_nat_rules(proxy.metadata_port):
+        router.iptables_manager.ipv4['nat'].add_rule(c, r)
+    router.iptables_manager.apply()
+
     if not isinstance(router, ha_router.HaRouter):
         proxy.spawn_monitored_metadata_proxy(
             l3_agent.process_monitor,
@@ -312,13 +305,3 @@ def before_router_removed(resource, event, l3_agent, payload=None):
                                            router.router['id'],
                                            l3_agent.conf,
                                            router.ns_name)
-
-
-@coordination.synchronized('router-lock-ns-{router.ns_name}')
-def apply_metadata_nat_rules(router, proxy):
-    for c, r in proxy.metadata_filter_rules(proxy.metadata_port,
-                                            proxy.metadata_access_mark):
-        router.iptables_manager.ipv4['filter'].add_rule(c, r)
-    for c, r in proxy.metadata_nat_rules(proxy.metadata_port):
-        router.iptables_manager.ipv4['nat'].add_rule(c, r)
-    router.iptables_manager.apply()

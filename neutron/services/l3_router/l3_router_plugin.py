@@ -49,6 +49,7 @@ from neutron.db import l3_gateway_ip_qos
 from neutron.db import l3_hamode_db
 from neutron.db import l3_hascheduler_db
 from neutron.db.models import l3 as l3_models
+from neutron.db import portforwardings_db
 from neutron.extensions import _admin_state_down_before_update_lib
 from neutron.quota import resource_registry
 from neutron import service
@@ -79,6 +80,7 @@ class L3RouterPlugin(service_base.ServicePluginBase,
                      l3_gateway_ip_qos.L3_gw_ip_qos_db_mixin,
                      l3_dvr_ha_scheduler_db.L3_DVR_HA_scheduler_db_mixin,
                      dns_db.DNSDbMixin,
+                     portforwardings_db.PortForwardingDbMixin,
                      l3_fip_qos.FloatingQoSDbMixin,
                      l3_fip_port_details.Fip_port_details_db_mixin,
                      l3_fip_pools_db.FloatingIPPoolsMixin):
@@ -100,6 +102,7 @@ class L3RouterPlugin(service_base.ServicePluginBase,
                                     l3_ext_ha_mode.ALIAS,
                                     router_availability_zone.ALIAS,
                                     l3_flavors.ALIAS, "qos-fip",
+                                    "portforwarding",
                                     fip_port_details.ALIAS,
                                     floatingip_pools.ALIAS,
                                     qos_gateway_ip.ALIAS,

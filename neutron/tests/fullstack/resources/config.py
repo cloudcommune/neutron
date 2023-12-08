@@ -83,7 +83,7 @@ class NeutronConfigFixture(ConfigFixture):
                      'password': rabbitmq_environment.password,
                      'host': rabbitmq_environment.host,
                      'vhost': rabbitmq_environment.vhost},
-                'api_workers': str(env_desc.api_workers),
+                'api_workers': '2',
             },
             'database': {
                 'connection': connection,
@@ -179,11 +179,9 @@ class ML2ConfigFixture(ConfigFixture):
             },
         })
 
-        extension_drivers = {'port_security'}
+        extension_drivers = ['port_security']
         if env_desc.qos:
-            extension_drivers.add(qos_ext.QOS_EXT_DRIVER_ALIAS)
-        if env_desc.ml2_extension_drivers:
-            extension_drivers.update(env_desc.ml2_extension_drivers)
+            extension_drivers.append(qos_ext.QOS_EXT_DRIVER_ALIAS)
         self.config['ml2']['extension_drivers'] = ','.join(extension_drivers)
 
 

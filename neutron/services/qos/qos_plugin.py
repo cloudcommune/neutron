@@ -43,7 +43,6 @@ from neutron.objects import network as network_object
 from neutron.objects import ports as ports_object
 from neutron.objects.qos import policy as policy_object
 from neutron.objects.qos import qos_policy_validator as checker
-from neutron.objects.qos import rule as rule_object
 from neutron.objects.qos import rule_type as rule_type_object
 from neutron.services.qos.drivers import manager
 
@@ -101,34 +100,9 @@ class QoSPlugin(qos.QoSPluginBase):
         port_res['resource_request'] = None
         if not qos_id:
             return port_res
+        qos_policy = policy_object.QosPolicy.get_object(
+            context.get_admin_context(), id=qos_id)
 
-        if port_res.get('bulk'):
-            port_res['resource_request'] = {
-                'qos_id': qos_id,
-                'network_id': port_db.network_id,
-                'vnic_type': port_res[portbindings.VNIC_TYPE]}
-            return port_res
-
-        min_bw_rules = rule_object.QosMinimumBandwidthRule.get_objects(
-            context.get_admin_context(), qos_policy_id=qos_id)
-        resources = QoSPlugin._get_resources(min_bw_rules)
-        if not resources:
-            return port_res
-
-        segments = network_object.NetworkSegment.get_objects(
-            context.get_admin_context(), network_id=port_db.network_id)
-        traits = QoSPlugin._get_traits(port_res[portbindings.VNIC_TYPE],
-                                       segments)
-        if not traits:
-            return port_res
-
-        port_res['resource_request'] = {
-            'required': traits,
-            'resources': resources}
-        return port_res
-
-    @staticmethod
-    def _get_resources(min_bw_rules):
         resources = {}
         # NOTE(ralonsoh): we should move this translation dict to n-lib.
         rule_direction_class = {
@@ -137,71 +111,34 @@ class QoSPlugin(qos.QoSPluginBase):
             nl_constants.EGRESS_DIRECTION:
                 pl_constants.CLASS_NET_BW_EGRESS_KBPS
         }
-        for rule in min_bw_rules:
-            resources[rule_direction_class[rule.direction]] = rule.min_kbps
-        return resources
+        for rule in qos_policy.rules:
+            if rule.rule_type == qos_consts.RULE_TYPE_MINIMUM_BANDWIDTH:
+                resources[rule_direction_class[rule.direction]] = rule.min_kbps
+        if not resources:
+            return port_res
 
-    @staticmethod
-    def _get_traits(vnic_type, segments):
-        # TODO(lajoskatona): Change to handle all segments when any traits
-        # support will be available. See Placement spec:
-        # https://review.opendev.org/565730
-        first_segment = segments[0]
-        if not first_segment or not first_segment.physical_network:
-            return []
-        physnet_trait = pl_utils.physnet_trait(
-            first_segment.physical_network)
         # NOTE(ralonsoh): we should not rely on the current execution order of
         # the port extending functions. Although here we have
         # port_res[VNIC_TYPE], we should retrieve this value from the port DB
         # object instead.
-        vnic_trait = pl_utils.vnic_type_trait(vnic_type)
+        vnic_trait = pl_utils.vnic_type_trait(
+            port_res[portbindings.VNIC_TYPE])
 
-        return [physnet_trait, vnic_trait]
+        # TODO(lajoskatona): Change to handle all segments when any traits
+        # support will be available. See Placement spec:
+        # https://review.opendev.org/565730
+        first_segment = network_object.NetworkSegment.get_objects(
+            context.get_admin_context(), network_id=port_db.network_id)[0]
 
-    @staticmethod
-    # TODO(obondarev): use neutron_lib constant
-    @resource_extend.extends(['ports_bulk'])
-    def _extend_port_resource_request_bulk(ports_res, noop):
-        """Add resource request to a list of ports."""
-        min_bw_rules = dict()
-        net_segments = dict()
+        if not first_segment or not first_segment.physical_network:
+            return port_res
+        physnet_trait = pl_utils.physnet_trait(
+            first_segment.physical_network)
 
-        for port_res in ports_res:
-            if port_res.get('resource_request') is None:
-                continue
-            qos_id = port_res['resource_request'].pop('qos_id', None)
-            if not qos_id:
-                port_res['resource_request'] = None
-                continue
-
-            net_id = port_res['resource_request'].pop('network_id')
-            vnic_type = port_res['resource_request'].pop('vnic_type')
-
-            if qos_id not in min_bw_rules:
-                rules = rule_object.QosMinimumBandwidthRule.get_objects(
-                    context.get_admin_context(), qos_policy_id=qos_id)
-                min_bw_rules[qos_id] = rules
-
-            resources = QoSPlugin._get_resources(min_bw_rules[qos_id])
-            if not resources:
-                continue
-
-            if net_id not in net_segments:
-                segments = network_object.NetworkSegment.get_objects(
-                    context.get_admin_context(),
-                    network_id=net_id)
-                net_segments[net_id] = segments
-
-            traits = QoSPlugin._get_traits(vnic_type, net_segments[net_id])
-            if not traits:
-                continue
-
-            port_res['resource_request'] = {
-                'required': traits,
-                'resources': resources}
-
-        return ports_res
+        port_res['resource_request'] = {
+            'required': [physnet_trait, vnic_trait],
+            'resources': resources}
+        return port_res
 
     def _get_ports_with_policy(self, context, policy):
         networks_ids = policy.get_bound_networks()

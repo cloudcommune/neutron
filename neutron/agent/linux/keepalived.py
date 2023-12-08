@@ -15,7 +15,6 @@
 import errno
 import itertools
 import os
-import signal
 
 import netaddr
 from neutron_lib import constants
@@ -40,7 +39,6 @@ GARP_MASTER_DELAY = 60
 HEALTH_CHECK_NAME = 'ha_health_check'
 
 LOG = logging.getLogger(__name__)
-SIGTERM_TIMEOUT = 5
 
 
 def get_free_range(parent_range, excluded_ranges, size=PRIMARY_VIP_RANGE_SIZE):
@@ -87,28 +85,24 @@ class InvalidAuthenticationTypeException(exceptions.NeutronException):
 class KeepalivedVipAddress(object):
     """A virtual address entry of a keepalived configuration."""
 
-    def __init__(self, ip_address, interface_name, scope=None, track=True):
+    def __init__(self, ip_address, interface_name, scope=None):
         self.ip_address = ip_address
         self.interface_name = interface_name
         self.scope = scope
-        self.track = track
 
     def __eq__(self, other):
         return (isinstance(other, KeepalivedVipAddress) and
                 self.ip_address == other.ip_address)
 
     def __str__(self):
-        return '[%s, %s, %s, %s]' % (self.ip_address,
-                                     self.interface_name,
-                                     self.scope,
-                                     self.track)
+        return '[%s, %s, %s]' % (self.ip_address,
+                                 self.interface_name,
+                                 self.scope)
 
     def build_config(self):
         result = '%s dev %s' % (self.ip_address, self.interface_name)
         if self.scope:
             result += ' scope %s' % self.scope
-        if cfg.CONF.keepalived_use_no_track and not self.track:
-            result += ' no_track'
         return result
 
 
@@ -130,8 +124,6 @@ class KeepalivedVirtualRoute(object):
             output += ' dev %s' % self.interface_name
         if self.scope:
             output += ' scope %s' % self.scope
-        if cfg.CONF.keepalived_use_no_track:
-            output += ' no_track'
         return output
 
 
@@ -154,13 +146,39 @@ class KeepalivedInstanceRoutes(object):
     def routes(self):
         return self.gateway_routes + self.extra_routes + self.extra_subnets
 
+    @property
+    def ecmp_routes(self):
+        # eg: ecmp_dict {'192.169.1.100': [route1, route2]}
+        ecmp_dict = dict()
+        for route in self.routes:
+            if ecmp_dict.get(route.destination):
+                ecmp_dict.get(route.destination).append(route)
+            else:
+                ecmp_dict[route.destination] = []
+                ecmp_dict.get(route.destination).append(route)
+        for k, v in ecmp_dict.items():
+            if len(v) == 1:
+                ecmp_dict.pop(k)
+        return ecmp_dict
+
+    def build_ecmp_routes(self):
+        ecmp_routes = []
+        for dest, routes in self.ecmp_routes.items():
+            for route in routes:
+                dest += ' nexthop via %s' % route.nexthop
+            ecmp_routes.append(dest)
+        return ecmp_routes
+
     def __len__(self):
         return len(self.routes)
 
     def build_config(self):
         return itertools.chain(['    virtual_routes {'],
                                ('        %s' % route.build_config()
-                                for route in self.routes),
+                                for route in self.routes if route.destination
+                                not in self.ecmp_routes.keys()),
+                               ('        %s' % ecmp_route
+                                for ecmp_route in self.build_ecmp_routes()),
                                ['    }'])
 
 
@@ -208,8 +226,7 @@ class KeepalivedInstance(object):
         self.authentication = (auth_type, password)
 
     def add_vip(self, ip_cidr, interface_name, scope):
-        track = interface_name in self.track_interfaces
-        vip = KeepalivedVipAddress(ip_cidr, interface_name, scope, track=track)
+        vip = KeepalivedVipAddress(ip_cidr, interface_name, scope)
         if vip not in self.vips:
             self.vips.append(vip)
         else:
@@ -447,6 +464,7 @@ class KeepalivedManager(object):
             self._get_keepalived_process_callback(vrrp_pm, config_path))
 
         keepalived_pm.enable(reload_cfg=True)
+        keepalived_pm.enable(reload_cfg=True)
 
         self.process_monitor.register(uuid=self.resource_id,
                                       service_name=KEEPALIVED_SERVICE_NAME,
@@ -459,21 +477,7 @@ class KeepalivedManager(object):
                                         service_name=KEEPALIVED_SERVICE_NAME)
 
         pm = self.get_process()
-        pm.disable(sig=str(int(signal.SIGTERM)))
-        try:
-            utils.wait_until_true(lambda: not pm.active,
-                                  timeout=SIGTERM_TIMEOUT)
-        except utils.WaitTimeout:
-            LOG.warning('Keepalived process %s did not finish after SIGTERM '
-                        'signal in %s seconds, sending SIGKILL signal',
-                        pm.pid, SIGTERM_TIMEOUT)
-            pm.disable(sig=str(int(signal.SIGKILL)))
-
-    def check_processes(self):
-        keepalived_pm = self.get_process()
-        vrrp_pm = self._get_vrrp_process(
-            self.get_vrrp_pid_file_name(keepalived_pm.get_pid_file_name()))
-        return keepalived_pm.active and vrrp_pm.active
+        pm.disable(sig='15')
 
     def get_process(self):
         return external_process.ProcessManager(

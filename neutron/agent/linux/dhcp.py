@@ -28,7 +28,6 @@ from neutron_lib.utils import file as file_utils
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import fileutils
-from oslo_utils import netutils
 from oslo_utils import uuidutils
 import six
 
@@ -59,26 +58,9 @@ NS_PREFIX = 'qdhcp-'
 DNSMASQ_SERVICE_NAME = 'dnsmasq'
 DHCP_RELEASE_TRIES = 3
 DHCP_RELEASE_TRIES_SLEEP = 0.3
-HOST_DHCPV6_TAG = 'tag:dhcpv6,'
 
 # this variable will be removed when neutron-lib is updated with this value
 DHCP_OPT_CLIENT_ID_NUM = 61
-
-
-def port_requires_dhcp_configuration(port):
-    if not getattr(port, 'device_owner', None):
-        # We can't check if port needs dhcp entry, so it will be better
-        # to create one
-        return True
-    # TODO(slaweq): define this list as a constant in neutron_lib.constants
-    # NOTE(slaweq): Not all port types which belongs e.g. to the routers can be
-    # excluded from that list. For some of them, like router interfaces used to
-    # plug subnet to the router should be configured in dnsmasq to provide DNS
-    # naming resolution. Otherwise it may slowdown e.g. traceroutes from the VM
-    return port.device_owner not in [
-        constants.DEVICE_OWNER_ROUTER_HA_INTF,
-        constants.DEVICE_OWNER_FLOATINGIP,
-        constants.DEVICE_OWNER_DHCP]
 
 
 class DictModel(dict):
@@ -336,7 +318,6 @@ class Dnsmasq(DhcpLocalProcess):
     _ID = 'id:'
 
     _IS_DHCP_RELEASE6_SUPPORTED = None
-    _IS_HOST_TAG_SUPPORTED = None
 
     @classmethod
     def check_version(cls):
@@ -440,8 +421,7 @@ class Dnsmasq(DhcpLocalProcess):
             cmd.append('--dhcp-option-force=option:T2,%ds' %
                        self.conf.dhcp_rebinding_time)
 
-        cmd.append('--conf-file=%s' %
-                   (self.conf.dnsmasq_config_file.strip() or '/dev/null'))
+        cmd.append('--conf-file=%s' % self.conf.dnsmasq_config_file)
         for server in self.conf.dnsmasq_dns_servers:
             cmd.append('--server=%s' % server)
 
@@ -500,12 +480,6 @@ class Dnsmasq(DhcpLocalProcess):
                 LOG.warning("dhcp_release6 is not present on this system, "
                             "will not call it again.")
         return self._IS_DHCP_RELEASE6_SUPPORTED
-
-    def _is_dnsmasq_host_tag_supported(self):
-        if self._IS_HOST_TAG_SUPPORTED is None:
-            self._IS_HOST_TAG_SUPPORTED = checks.dnsmasq_host_tag_support()
-
-        return self._IS_HOST_TAG_SUPPORTED
 
     def _release_lease(self, mac_address, ip, ip_version, client_id=None,
                        server_id=None, iaid=None):
@@ -593,89 +567,7 @@ class Dnsmasq(DhcpLocalProcess):
                     constants.DHCPV6_STATELESS))),
             reverse=True)
 
-    def _merge_alloc_addr6_list(self, fixed_ips, v6_nets):
-        """Merge fixed_ips to ipv6 addr lists
-
-        If a port have multiple IPv6 addresses in the same subnet, merge the
-        into one entry listing all the addresess, creating a single dhcp-host
-        entry with the list of addresses defined allow dnsmasq to make all
-        addresses available as requests for leases arrive.
-
-        See dnsmasq-discuss mailing list: http://lists.thekelleys.org.uk/
-        pipermail/dnsmasq-discuss/2020q1/013743.html
-
-        """
-        by_subnet = {}
-        NewFip = collections.namedtuple('NewFip', 'subnet_id ip_address')
-        merged = []
-
-        for fip in fixed_ips:
-            if (fip.subnet_id in v6_nets and
-                    v6_nets[fip.subnet_id].ipv6_address_mode == (
-                            constants.DHCPV6_STATEFUL)):
-                if fip.subnet_id not in by_subnet:
-                    by_subnet.update({fip.subnet_id: []})
-                by_subnet[fip.subnet_id].append(fip.ip_address)
-            else:
-                merged.append(fip)
-
-        for subnet_id in by_subnet:
-            addr6_list = ','.join([self._format_address_for_dnsmasq(ip)
-                                   for ip in by_subnet[subnet_id]])
-            merged.append(NewFip(subnet_id=subnet_id,
-                                 ip_address=addr6_list))
-
-        return merged
-
-    def _get_dns_assignment(self, ip_address, dns_assignment):
-        """Get DNS assignment hostname and fqdn
-
-        In dnsmasq it is not possible to configure two dhcp-host
-        entries mapped to a single client mac address with IP
-        addresses in the same subnet. When recieving a requst
-        dnsmasq will match on the first entry in it's config,
-        and lease that address. The second entry will never be
-        used.
-
-        For IPv6 it is possible to add multiple IPv6 addresses
-        to a single dhcp-host entry by placing a list of addresses
-        in brackets, i.e [addr1][addr2][...]. See dnsmasq mailing
-        list: http://lists.thekelleys.org.uk/pipermail/
-        dnsmasq-discuss/2020q1/013671.html. Since we cannot have
-        two hostnames in the dhcp-host entry this method picks the
-        first hostname and fqdn it find's matching one of the IP's
-        in the fixed-ips in dns_assignment or the hostname is
-        generated based on the first fixed-ip.
-
-        :param ip_address: IP address or a list of IPv6 addresses
-        :param dns_ip_map: DNS IP Mapping
-        :param dns_assignment: DNS assignments
-        :return: hostname, fqdn
-        """
-        hostname, fqdn = None, None
-        ip_addresses = ip_address.replace('[', '').split(']')
-
-        if dns_assignment:
-            dns_ip_map = {d.ip_address: d for d in dns_assignment}
-            for addr in ip_addresses:
-                # If dns_name attribute is supported by ports API, return the
-                # dns_assignment generated by the Neutron server. Otherwise,
-                # generate hostname and fqdn locally (previous behaviour)
-                if addr in dns_ip_map:
-                    hostname = dns_ip_map[addr].hostname
-                    fqdn = dns_ip_map[addr].fqdn
-                    break
-
-        if hostname is None:
-            hostname = ('host-%s' %
-                        ip_addresses[0].replace('.', '-').replace(':', '-'))
-            fqdn = hostname
-            if self.conf.dns_domain:
-                fqdn = '%s.%s' % (fqdn, self.conf.dns_domain)
-
-        return hostname, fqdn
-
-    def _iter_hosts(self, merge_addr6_list=False):
+    def _iter_hosts(self):
         """Iterate over hosts.
 
         For each host on the network we yield a tuple containing:
@@ -689,7 +581,6 @@ class Dnsmasq(DhcpLocalProcess):
             no_dhcp,  # A flag indicating that the address doesn't need a DHCP
                       # IP address.
             no_opts,  # A flag indication that options shouldn't be written
-            tag,    # A dhcp-host tag to add to the configuration if supported
         )
         """
         v6_nets = dict((subnet.id, subnet) for subnet in
@@ -697,36 +588,37 @@ class Dnsmasq(DhcpLocalProcess):
                        if subnet.ip_version == 6)
 
         for port in self.network.ports:
-            if not port_requires_dhcp_configuration(port):
-                continue
-
             fixed_ips = self._sort_fixed_ips_for_dnsmasq(port.fixed_ips,
                                                          v6_nets)
-            # TODO(hjensas): Drop this conditional and option once distros
-            #  generally have dnsmasq supporting addr6 list and range.
-            if self.conf.dnsmasq_enable_addr6_list and merge_addr6_list:
-                fixed_ips = self._merge_alloc_addr6_list(fixed_ips, v6_nets)
             # Confirm whether Neutron server supports dns_name attribute in the
             # ports API
             dns_assignment = getattr(port, 'dns_assignment', None)
+            if dns_assignment:
+                dns_ip_map = {d.ip_address: d for d in dns_assignment}
             for alloc in fixed_ips:
                 no_dhcp = False
                 no_opts = False
-                tag = ''
                 if alloc.subnet_id in v6_nets:
                     addr_mode = v6_nets[alloc.subnet_id].ipv6_address_mode
                     no_dhcp = addr_mode in (constants.IPV6_SLAAC,
                                             constants.DHCPV6_STATELESS)
-                    if self._is_dnsmasq_host_tag_supported():
-                        tag = HOST_DHCPV6_TAG
                     # we don't setup anything for SLAAC. It doesn't make sense
                     # to provide options for a client that won't use DHCP
                     no_opts = addr_mode == constants.IPV6_SLAAC
 
-                hostname, fqdn = self._get_dns_assignment(alloc.ip_address,
-                                                          dns_assignment)
-
-                yield (port, alloc, hostname, fqdn, no_dhcp, no_opts, tag)
+                # If dns_name attribute is supported by ports API, return the
+                # dns_assignment generated by the Neutron server. Otherwise,
+                # generate hostname and fqdn locally (previous behaviour)
+                if dns_assignment:
+                    hostname = dns_ip_map[alloc.ip_address].hostname
+                    fqdn = dns_ip_map[alloc.ip_address].fqdn
+                else:
+                    hostname = 'host-%s' % alloc.ip_address.replace(
+                        '.', '-').replace(':', '-')
+                    fqdn = hostname
+                    if self.conf.dns_domain:
+                        fqdn = '%s.%s' % (fqdn, self.conf.dns_domain)
+                yield (port, alloc, hostname, fqdn, no_dhcp, no_opts)
 
     def _get_port_extra_dhcp_opts(self, port):
         return getattr(port, edo_ext.EXTRADHCPOPTS, False)
@@ -760,7 +652,7 @@ class Dnsmasq(DhcpLocalProcess):
             s.id for s in self._get_all_subnets(self.network)
             if s.enable_dhcp and s.ip_version == constants.IP_VERSION_4]
         for host_tuple in self._iter_hosts():
-            port, alloc, hostname, name, no_dhcp, no_opts, tag = host_tuple
+            port, alloc, hostname, name, no_dhcp, no_opts = host_tuple
             # don't write ip address which belongs to a dhcp disabled subnet
             # or an IPv6 subnet.
             if no_dhcp or alloc.subnet_id not in dhcpv4_enabled_subnet_ids:
@@ -810,12 +702,12 @@ class Dnsmasq(DhcpLocalProcess):
                                    if s.enable_dhcp]
         # NOTE(ihrachyshka): the loop should not log anything inside it, to
         # avoid potential performance drop when lots of hosts are dumped
-        for host_tuple in self._iter_hosts(merge_addr6_list=True):
-            port, alloc, hostname, name, no_dhcp, no_opts, tag = host_tuple
+        for host_tuple in self._iter_hosts():
+            port, alloc, hostname, name, no_dhcp, no_opts = host_tuple
             if no_dhcp:
                 if not no_opts and self._get_port_extra_dhcp_opts(port):
-                    buf.write('%s,%s%s%s\n' % (
-                        port.mac_address, tag,
+                    buf.write('%s,%s%s\n' % (
+                        port.mac_address,
                         'set:', self._PORT_TAG_PREFIX % port.id))
                 continue
 
@@ -828,21 +720,21 @@ class Dnsmasq(DhcpLocalProcess):
             if self._get_port_extra_dhcp_opts(port):
                 client_id = self._get_client_id(port)
                 if client_id and len(port.extra_dhcp_opts) > 1:
-                    buf.write('%s,%s%s%s,%s,%s,%s%s\n' %
-                              (port.mac_address, tag, self._ID, client_id,
-                               name, ip_address, 'set:',
+                    buf.write('%s,%s%s,%s,%s,%s%s\n' %
+                              (port.mac_address, self._ID, client_id, name,
+                               ip_address, 'set:',
                                self._PORT_TAG_PREFIX % port.id))
                 elif client_id and len(port.extra_dhcp_opts) == 1:
-                    buf.write('%s,%s%s%s,%s,%s\n' %
-                              (port.mac_address, tag, self._ID, client_id,
-                               name, ip_address))
+                    buf.write('%s,%s%s,%s,%s\n' %
+                              (port.mac_address, self._ID, client_id, name,
+                               ip_address))
                 else:
-                    buf.write('%s,%s%s,%s,%s%s\n' %
-                              (port.mac_address, tag, name, ip_address,
+                    buf.write('%s,%s,%s,%s%s\n' %
+                              (port.mac_address, name, ip_address,
                                'set:', self._PORT_TAG_PREFIX % port.id))
             else:
-                buf.write('%s,%s%s,%s\n' %
-                          (port.mac_address, tag, name, ip_address))
+                buf.write('%s,%s,%s\n' %
+                          (port.mac_address, name, ip_address))
 
         file_utils.replace_file(filename, buf.getvalue())
         LOG.debug('Done building host file %s', filename)
@@ -856,11 +748,6 @@ class Dnsmasq(DhcpLocalProcess):
                                     str(DHCP_OPT_CLIENT_ID_NUM)):
                     return opt.opt_value
 
-    @staticmethod
-    def _parse_ip_addresses(ip_list):
-        ip_list = [ip.strip('[]') for ip in ip_list]
-        return [ip for ip in ip_list if netutils.is_valid_ip(ip)]
-
     def _read_hosts_file_leases(self, filename):
         leases = set()
         try:
@@ -872,14 +759,11 @@ class Dnsmasq(DhcpLocalProcess):
                     if host[1].startswith('set:'):
                         continue
                     if host[1].startswith(self._ID):
-                        ips = self._parse_ip_addresses(host[3:])
+                        ip = host[3].strip('[]')
                         client_id = host[1][len(self._ID):]
-                    elif host[1].startswith('tag:'):
-                        ips = self._parse_ip_addresses(host[3:])
                     else:
-                        ips = self._parse_ip_addresses(host[2:])
-                    for ip in ips:
-                        leases.add((ip, mac, client_id))
+                        ip = host[2].strip('[]')
+                    leases.add((ip, mac, client_id))
         except (OSError, IOError):
             LOG.debug('Error while reading hosts file %s', filename)
         return leases
@@ -1046,7 +930,7 @@ class Dnsmasq(DhcpLocalProcess):
         """
         buf = six.StringIO()
         for host_tuple in self._iter_hosts():
-            port, alloc, hostname, fqdn, no_dhcp, no_opts, tag = host_tuple
+            port, alloc, hostname, fqdn, no_dhcp, no_opts = host_tuple
             # It is compulsory to write the `fqdn` before the `hostname` in
             # order to obtain it in PTR responses.
             if alloc:

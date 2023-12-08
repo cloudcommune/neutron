@@ -23,9 +23,7 @@ import httplib2
 import mock
 from neutron_lib import worker as neutron_worker
 from oslo_config import cfg
-from oslo_log import log
 import psutil
-import six
 
 from neutron.common import utils
 from neutron import manager
@@ -33,8 +31,6 @@ from neutron import service
 from neutron.tests.functional import base
 from neutron import wsgi
 
-
-LOG = log.getLogger(__name__)
 
 CONF = cfg.CONF
 
@@ -159,19 +155,12 @@ class TestNeutronServer(base.BaseLoggingTestCase):
         # Wait for temp file to be created and its size reaching the expected
         # value
         expected_size = len(expected_msg)
-
-        def is_temp_file_ok():
-            LOG.debug("Checking file %s", self.temp_file)
-            if not os.path.isfile(self.temp_file):
-                LOG.debug("File %s not exists.", self.temp_file)
-                return False
-            temp_file_size = os.stat(self.temp_file).st_size
-            LOG.debug("Size of file %s is %s. Expected size: %s",
-                      self.temp_file, temp_file_size, expected_size)
-            return temp_file_size == expected_size
+        condition = lambda: (os.path.isfile(self.temp_file) and
+                             os.stat(self.temp_file).st_size ==
+                             expected_size)
 
         try:
-            utils.wait_until_true(is_temp_file_ok, timeout=5, sleep=1)
+            utils.wait_until_true(condition, timeout=5, sleep=1)
         except utils.TimerTimeout:
             if not os.path.isfile(self.temp_file):
                 raise RuntimeError(
@@ -239,7 +228,7 @@ class TestWsgiServer(TestNeutronServer):
 
             # Memorize a port that was chosen for the service
             self.port = server.port
-            os.write(self.pipeout, six.b(str(self.port)))
+            os.write(self.pipeout, bytes(self.port))
 
             server.wait()
 

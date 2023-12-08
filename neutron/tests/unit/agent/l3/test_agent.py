@@ -54,7 +54,6 @@ from neutron.agent.linux import ip_lib
 from neutron.agent.linux import iptables_manager
 from neutron.agent.linux import pd
 from neutron.agent.linux import ra
-from neutron.agent.linux import utils as linux_utils
 from neutron.agent.metadata import driver as metadata_driver
 from neutron.agent import rpc as agent_rpc
 from neutron.conf.agent import common as agent_config
@@ -1214,11 +1213,8 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
             self.assertIsNone(res_ip)
             self.assertTrue(log_error.called)
 
-    @mock.patch.object(dvr_router.DvrEdgeRouter, 'load_used_fip_information')
     @mock.patch.object(dvr_router_base.LOG, 'error')
-    def test_get_snat_port_for_internal_port_ipv6_same_port(self,
-                                                            log_error,
-                                                            load_used_fips):
+    def test_get_snat_port_for_internal_port_ipv6_same_port(self, log_error):
         router = l3_test_common.prepare_router_data(
             ip_version=lib_constants.IP_VERSION_4, enable_snat=True,
             num_internal_ports=1)
@@ -2755,59 +2751,35 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
         self._test_process_routers_update_rpc_timeout(ext_net_call=True,
                                                       ext_net_call_failed=True)
 
-    def test_process_routers_update_router_update(self):
-        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
-        agent._queue = mock.Mock()
-        update = mock.Mock()
-        update.resource = None
-        update.action = l3_agent.ADD_UPDATE_ROUTER
-        router_info = mock.MagicMock()
-        agent.router_info[update.id] = router_info
-        router_processor = mock.Mock()
-        agent._queue.each_update_to_next_resource.side_effect = [
-            [(router_processor, update)]]
-        agent._resync_router = mock.Mock()
-        agent._safe_router_removed = mock.Mock()
-        agent.plugin_rpc = mock.MagicMock()
-        agent.plugin_rpc.get_routers.side_effect = (
-            Exception("Failed to get router info"))
-        # start test
-        agent._process_router_update()
-        router_info.delete.assert_not_called()
-        self.assertFalse(router_info.delete.called)
-        self.assertTrue(agent.router_info)
-        self.assertTrue(agent._resync_router.called)
-        self.assertFalse(agent._safe_router_removed.called)
-
-    def _test_process_routers_update_router_deleted(self,
+    @mock.patch.object(pd, 'remove_router')
+    def _test_process_routers_update_router_deleted(self, remove_router,
                                                     error=False):
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
         agent._queue = mock.Mock()
         update = mock.Mock()
         update.resource = None
-        update.action = l3_agent.DELETE_ROUTER
+        update.action = 1  # ROUTER_DELETED
         router_info = mock.MagicMock()
         agent.router_info[update.id] = router_info
         router_processor = mock.Mock()
         agent._queue.each_update_to_next_resource.side_effect = [
             [(router_processor, update)]]
         agent._resync_router = mock.Mock()
-        agent._safe_router_removed = mock.Mock()
         if error:
+            agent._safe_router_removed = mock.Mock()
             agent._safe_router_removed.return_value = False
         agent._process_router_update()
         if error:
             self.assertFalse(router_processor.fetched_and_processed.called)
             agent._resync_router.assert_called_with(update)
-            self.assertTrue(agent._safe_router_removed.called)
+            self.assertFalse(remove_router.called)
         else:
-            router_info.delete.assert_not_called()
-            self.assertFalse(router_info.delete.called)
-            self.assertTrue(agent.router_info)
+            router_info.delete.assert_called_once_with()
+            self.assertFalse(agent.router_info)
             self.assertFalse(agent._resync_router.called)
             router_processor.fetched_and_processed.assert_called_once_with(
                 update.timestamp)
-            self.assertTrue(agent._safe_router_removed.called)
+            self.assertTrue(remove_router.called)
 
     def test_process_routers_update_router_deleted_success(self):
         self._test_process_routers_update_router_deleted()
@@ -2855,16 +2827,6 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
         router.distributed = True
         router.ha = True
         router_info = mock.MagicMock()
-
-        def mock_get(name):
-            if name == 'ha':
-                return router.ha
-            if name == 'distributed':
-                return router.distributed
-            return mock.Mock()
-
-        router_info.router.get.side_effect = mock_get
-
         agent.router_info[router.id] = router_info
         updated_router = {'id': '1234',
                           'distributed': True,
@@ -2897,16 +2859,6 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
         router._ha_interface = True
         router.ha = True
         router_info = mock.MagicMock()
-
-        def mock_get(name):
-            if name == 'ha':
-                return router.ha
-            if name == 'distributed':
-                return router.distributed
-            return mock.Mock()
-
-        router_info.router.get.side_effect = mock_get
-
         agent.router_info[router.id] = router_info
         updated_router = {'id': '1234',
                           'distributed': True, 'ha': True,
@@ -2971,46 +2923,6 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
         agent._process_router_if_compatible(router)
         self.assertIn(router['id'], agent.router_info)
 
-    def test_process_router_if_compatible_type_match(self):
-        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
-
-        router = {'id': _uuid(),
-                  'routes': [],
-                  'admin_state_up': True,
-                  'ha': False, 'distributed': False,
-                  'external_gateway_info': {'network_id': 'aaa'}}
-
-        ri = mock.Mock(router=router)
-        agent.router_info[router['id']] = ri
-        with mock.patch.object(agent, "_create_router") as create_router_mock:
-            agent._process_router_if_compatible(router)
-        create_router_mock.assert_not_called()
-        self.assertIn(router['id'], agent.router_info)
-        self.assertFalse(agent.router_info[router['id']].router['ha'])
-        self.assertFalse(agent.router_info[router['id']].router['distributed'])
-
-    def test_process_router_if_compatible_type_changed(self):
-        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
-
-        router = {'id': _uuid(),
-                  'routes': [],
-                  'admin_state_up': True,
-                  'revision_number': 1,
-                  'ha': True, 'distributed': False,
-                  'external_gateway_info': {'network_id': 'aaa'}}
-
-        ri = mock.Mock(router=router)
-        agent.router_info[router['id']] = ri
-        new_router = copy.deepcopy(router)
-        new_router['ha'] = False
-        with mock.patch.object(agent, "_create_router") as create_router_mock:
-            agent._process_router_if_compatible(new_router)
-        create_router_mock.assert_called_once_with(
-            new_router['id'], new_router)
-        self.assertIn(router['id'], agent.router_info)
-        self.assertFalse(agent.router_info[router['id']].router['ha'])
-        self.assertFalse(agent.router_info[router['id']].router['distributed'])
-
     def test_nonexistent_interface_driver(self):
         self.conf.set_override('interface_driver', None)
         self.assertRaises(SystemExit, l3_agent.L3NATAgent,
@@ -3062,10 +2974,9 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
                             dvr_snat_ns.SNAT_NS_PREFIX + 'foo']
         other_namespaces = ['unknown']
 
-        with mock.patch.object(linux_utils, 'delete_if_exists'):
-            self._cleanup_namespace_test(stale_namespaces,
-                                         [],
-                                         other_namespaces)
+        self._cleanup_namespace_test(stale_namespaces,
+                                     [],
+                                     other_namespaces)
 
     def test_cleanup_namespace_with_registered_router_ids(self):
         stale_namespaces = [namespaces.NS_PREFIX + 'cccc',
@@ -3075,10 +2986,9 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
                        {'id': 'aaaa', 'distributed': False}]
         other_namespaces = ['qdhcp-aabbcc', 'unknown']
 
-        with mock.patch.object(linux_utils, 'delete_if_exists'):
-            self._cleanup_namespace_test(stale_namespaces,
-                                         router_list,
-                                         other_namespaces)
+        self._cleanup_namespace_test(stale_namespaces,
+                                     router_list,
+                                     other_namespaces)
 
     def test_create_dvr_gateway(self):
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
@@ -3904,53 +3814,6 @@ class TestBasicRouterOperations(BasicRouterOperationsFramework):
 
         self._pd_assert_dibbler_calls(expected_calls,
             self.external_process.mock_calls[-len(expected_calls):])
-
-    @mock.patch.object(pd.PrefixDelegation, 'update_subnet')
-    @mock.patch.object(dibbler.PDDibbler, 'get_prefix', autospec=True)
-    @mock.patch.object(dibbler.os, 'getpid', return_value=1234)
-    @mock.patch.object(pd.PrefixDelegation, '_is_lla_active',
-                       return_value=True)
-    @mock.patch.object(dibbler.os, 'chmod')
-    @mock.patch.object(dibbler.shutil, 'rmtree')
-    @mock.patch.object(pd.PrefixDelegation, '_get_sync_data')
-    def test_pd_lla_already_exists(self, mock1, mock2, mock3, mock4,
-                                   mock_getpid, mock_get_prefix,
-                                   mock_pd_update_subnet):
-        '''Test HA in the active router
-        The intent is to test the PD code with HA. To avoid unnecessary
-        complexities, use the regular router.
-        '''
-        # Initial setup
-        agent, router, ri = self._pd_setup_agent_router(enable_ha=True)
-
-        agent.pd.intf_driver = mock.MagicMock()
-        agent.pd.intf_driver.add_ipv6_addr.side_effect = (
-                ip_lib.IpAddressAlreadyExists())
-
-        # Create one pd-enabled subnet and add router interface
-        l3_test_common.router_append_pd_enabled_subnet(router)
-        self._pd_add_gw_interface(agent, ri)
-        ri.process()
-
-        # No client should be started since it's standby router
-        agent.pd.process_prefix_update()
-        self.assertFalse(self.external_process.called)
-        self.assertFalse(mock_get_prefix.called)
-
-        update_router = copy.deepcopy(router)
-        pd_intfs = l3_test_common.get_unassigned_pd_interfaces(update_router)
-
-        # Turn the router to be active
-        agent.pd.process_ha_state(router['id'], True)
-
-        # Get prefixes
-        self._pd_get_prefixes(agent, ri, [], pd_intfs, mock_get_prefix)
-
-        # Update the router with the new prefix
-        ri.router = update_router
-        ri.process()
-
-        self._pd_verify_update_results(ri, pd_intfs, mock_pd_update_subnet)
 
     @mock.patch.object(dibbler.os, 'chmod')
     def test_pd_generate_dibbler_conf(self, mock_chmod):

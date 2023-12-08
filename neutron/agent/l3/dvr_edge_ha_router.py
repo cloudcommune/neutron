@@ -112,11 +112,13 @@ class DvrEdgeHaRouter(dvr_edge_router.DvrEdgeRouter,
         ha_router.HaRouter.external_gateway_updated(self, ex_gw_port,
                                                     interface_name)
 
+    def initialize(self, process_monitor):
+        self._create_snat_namespace()
+        super(DvrEdgeHaRouter, self).initialize(process_monitor)
+
     def _external_gateway_added(self, ex_gw_port, interface_name,
                                 ns_name, preserve_ips):
-        link_up = self.external_gateway_link_up()
-        self._plug_external_gateway(ex_gw_port, interface_name, ns_name,
-                                    link_up=link_up)
+        self._plug_external_gateway(ex_gw_port, interface_name, ns_name)
 
     def _is_this_snat_host(self):
         return self.agent_conf.agent_mode == constants.L3_AGENT_MODE_DVR_SNAT

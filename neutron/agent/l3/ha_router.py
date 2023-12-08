@@ -30,7 +30,6 @@ from neutron.agent.linux import keepalived
 from neutron.common import utils as common_utils
 from neutron.extensions import revisions
 from neutron.extensions import timestamp
-from neutron.ipam import utils as ipam_utils
 
 LOG = logging.getLogger(__name__)
 HA_DEV_PREFIX = 'ha-'
@@ -66,11 +65,12 @@ class HaRouterNamespace(namespaces.RouterNamespace):
 
 
 class HaRouter(router.RouterInfo):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, state_change_callback, *args, **kwargs):
         super(HaRouter, self).__init__(*args, **kwargs)
 
         self.ha_port = None
         self.keepalived_manager = None
+        self.state_change_callback = state_change_callback
         self._ha_state = None
         self._ha_state_path = None
 
@@ -93,15 +93,6 @@ class HaRouter(router.RouterInfo):
     @property
     def ha_vr_id(self):
         return self.router.get('ha_vr_id')
-
-    def _check_and_set_real_state(self):
-        # When the physical host was down/up, the 'master' router may still
-        # have its original state in the _ha_state_path file. We directly
-        # reset it to 'backup'.
-        if (not self.keepalived_manager.check_processes() and
-                os.path.exists(self.ha_state_path) and
-                self.ha_state == 'master'):
-            self.ha_state = 'backup'
 
     @property
     def ha_state(self):
@@ -148,8 +139,8 @@ class HaRouter(router.RouterInfo):
 
         self.set_ha_port()
         self._init_keepalived_manager(process_monitor)
-        self._check_and_set_real_state()
         self.ha_network_added()
+        self.update_initial_state(self.state_change_callback)
         self.spawn_state_change_monitor(process_monitor)
 
     def _init_keepalived_manager(self, process_monitor):
@@ -198,10 +189,7 @@ class HaRouter(router.RouterInfo):
             return
         self.keepalived_manager.disable()
         conf_dir = self.keepalived_manager.get_conf_dir()
-        try:
-            shutil.rmtree(conf_dir)
-        except FileNotFoundError:
-            pass
+        shutil.rmtree(conf_dir)
 
     def _get_keepalived_instance(self):
         return self.keepalived_manager.config.get_instance(self.ha_vr_id)
@@ -261,11 +249,35 @@ class HaRouter(router.RouterInfo):
         return set(self._get_cidrs_from_keepalived(device.name))
 
     def routes_updated(self, old_routes, new_routes):
+        ex_gw_port = self.get_ex_gw_port()
+        ex_gw_port_id = (ex_gw_port and ex_gw_port['id'] or
+                         self.ex_gw_port and self.ex_gw_port['id'])
+
+        interface_name = None
+        if ex_gw_port_id:
+            interface_name = self.get_external_device_name(ex_gw_port_id)
+        if ex_gw_port:
+            self._add_default_gw_virtual_route(ex_gw_port, interface_name)
         instance = self._get_keepalived_instance()
+        ipv4_default_nexthop = ''
+        ipv6_default_nexthop = ''
+        for route in new_routes:
+            if route['destination'] == '0.0.0.0/0':
+                ipv4_default_nexthop = route['nexthop']
+            if route['destination'] == '::/0':
+                ipv6_default_nexthop = route['nexthop']
+        for gw_vr in instance.virtual_routes.gateway_routes:
+            if gw_vr.destination == '0.0.0.0/0' and ipv4_default_nexthop != '':
+                gw_vr.nexthop = ipv4_default_nexthop
+                gw_vr.interface_name = ''
+            if gw_vr.destination == '::/0' and ipv6_default_nexthop != '':
+                gw_vr.nexthop = ipv6_default_nexthop
+                gw_vr.interface_name = ''
+
         instance.virtual_routes.extra_routes = [
             keepalived.KeepalivedVirtualRoute(
                 route['destination'], route['nexthop'])
-            for route in new_routes]
+            for route in new_routes if not route['destination'].endswith('/0')]
         super(HaRouter, self).routes_updated(old_routes, new_routes)
 
     def _add_default_gw_virtual_route(self, ex_gw_port, interface_name):
@@ -273,14 +285,6 @@ class HaRouter(router.RouterInfo):
 
         default_gw_rts = []
         instance = self._get_keepalived_instance()
-        for subnet in ex_gw_port.get('subnets', []):
-            is_gateway_not_in_subnet = (subnet['gateway_ip'] and
-                                        not ipam_utils.check_subnet_ip(
-                                            subnet['cidr'],
-                                            subnet['gateway_ip']))
-            if is_gateway_not_in_subnet:
-                default_gw_rts.append(keepalived.KeepalivedVirtualRoute(
-                    subnet['gateway_ip'], None, interface_name, scope='link'))
         for gw_ip in gateway_ips:
             # TODO(Carl) This is repeated everywhere.  A method would
             # be nice.
@@ -386,11 +390,11 @@ class HaRouter(router.RouterInfo):
 
     def _get_state_change_monitor_process_manager(self):
         return external_process.ProcessManager(
-            conf=self.agent_conf, uuid='%s.monitor' % self.router_id,
-            namespace=self.ha_namespace,
+            self.agent_conf,
+            '%s.monitor' % self.router_id,
+            self.ha_namespace,
             service=KEEPALIVED_STATE_CHANGE_MONITOR_SERVICE_NAME,
-            default_cmd_callback=self._get_state_change_monitor_callback(),
-            run_as_root=True)
+            default_cmd_callback=self._get_state_change_monitor_callback())
 
     def _get_state_change_monitor_callback(self):
         ha_device = self.get_ha_device_name()
@@ -441,6 +445,15 @@ class HaRouter(router.RouterInfo):
         except common_utils.WaitTimeout:
             pm.disable(sig=str(int(signal.SIGKILL)))
 
+    def update_initial_state(self, callback):
+        addresses = ip_lib.get_devices_with_ip(self.ha_namespace,
+                                               name=self.get_ha_device_name())
+        cidrs = (address['cidr'] for address in addresses)
+        ha_cidr = self._get_primary_vip()
+        state = 'master' if ha_cidr in cidrs else 'backup'
+        self.ha_state = state
+        callback(self.router_id, state)
+
     @staticmethod
     def _gateway_ports_equal(port1, port2):
         def _get_filtered_dict(d, ignore):
@@ -453,9 +466,7 @@ class HaRouter(router.RouterInfo):
         return port1_filtered == port2_filtered
 
     def external_gateway_added(self, ex_gw_port, interface_name):
-        link_up = self.external_gateway_link_up()
-        self._plug_external_gateway(ex_gw_port, interface_name,
-                                    self.ns_name, link_up=link_up)
+        self._plug_external_gateway(ex_gw_port, interface_name, self.ns_name)
         self._add_gateway_vip(ex_gw_port, interface_name)
         self._disable_ipv6_addressing_on_interface(interface_name)
 
@@ -519,30 +530,3 @@ class HaRouter(router.RouterInfo):
         if (self.keepalived_manager.get_process().active and
                 self.ha_state == 'master'):
             super(HaRouter, self).enable_radvd(internal_ports)
-
-    def external_gateway_link_up(self):
-        # Check HA router ha_state for its gateway port link state.
-        # 'backup' instance will not link up the gateway port.
-        return self.ha_state == 'master'
-
-    def set_external_gw_port_link_status(self, link_up, set_gw=False):
-        link_state = "up" if link_up else "down"
-        LOG.info('Set router %s gateway device link state to %s.',
-                 self.router_id, link_state)
-
-        ex_gw_port = self.get_ex_gw_port()
-        ex_gw_port_id = (ex_gw_port and ex_gw_port['id'] or
-                         self.ex_gw_port and self.ex_gw_port['id'])
-        if ex_gw_port_id:
-            interface_name = self.get_external_device_name(ex_gw_port_id)
-            ns_name = self.get_gw_ns_name()
-            if (not self.driver.set_link_status(
-                    interface_name, namespace=ns_name, link_up=link_up) and
-                    link_up):
-                LOG.error('Gateway interface for router %s was not set up; '
-                          'router will not work properly', self.router_id)
-            if link_up and set_gw:
-                preserve_ips = self.get_router_preserve_ips()
-                self._external_gateway_settings(ex_gw_port, interface_name,
-                                                ns_name, preserve_ips)
-                self.routes_updated([], self.routes)

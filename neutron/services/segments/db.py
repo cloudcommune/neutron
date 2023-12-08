@@ -38,7 +38,6 @@ from neutron.services.segments import exceptions
 
 
 _USER_CONFIGURED_SEGMENT_PLUGIN = None
-FOR_NET_DELETE = 'for_net_delete'
 
 
 def check_user_configured_segment_plugin():
@@ -190,7 +189,7 @@ class SegmentDbMixin(object):
                          self.delete_segment,
                          payload=events.DBEventPayload(
                              context, metadata={
-                                 FOR_NET_DELETE: for_net_delete},
+                                 'for_net_delete': for_net_delete},
                              states=(segment_dict,),
                              resource_id=uuid))
 
@@ -201,15 +200,12 @@ class SegmentDbMixin(object):
             # Do some preliminary operations before deleting segment in db
             registry.notify(resources.SEGMENT, events.PRECOMMIT_DELETE,
                             self.delete_segment, context=context,
-                            segment=segment_dict,
-                            for_net_delete=for_net_delete)
+                            segment=segment_dict)
 
         registry.publish(resources.SEGMENT, events.AFTER_DELETE,
                          self.delete_segment,
                          payload=events.DBEventPayload(
-                             context, metadata={
-                                 FOR_NET_DELETE: for_net_delete},
-                             states=(segment_dict,),
+                             context, states=(segment_dict,),
                              resource_id=uuid))
 
 
@@ -335,7 +331,7 @@ def _add_segment_host_mapping_for_segment(resource, event, trigger,
 
 
 def _delete_segments_for_network(resource, event, trigger,
-                                 context, network_id, **kwargs):
+                                 context, network_id):
     admin_ctx = context.elevated()
     global segments_plugin
     if not segments_plugin:

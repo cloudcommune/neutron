@@ -782,54 +782,6 @@ class TestDvrRouter(DvrRouterTestFramework, framework.L3AgentTestFramework):
             self._assert_iptables_rules_exist(
                 iptables_mgr, 'nat', expected_rules)
 
-    def test_dvr_router_fip_associations_exist_when_router_reenabled(self):
-        """Test to validate the fip associations when router is re-enabled.
-
-        This test validates the fip associations when the router is disabled
-        and enabled back again. This test is specifically for the host where
-        snat namespace is not created or gateway port is binded on other host.
-        """
-        self.agent.conf.agent_mode = 'dvr_snat'
-        router_info = self.generate_dvr_router_info(enable_snat=True)
-        # Ensure agent does not create snat namespace by changing gw_port_host
-        router_info['gw_port_host'] = 'agent2'
-        router_info_copy = copy.deepcopy(router_info)
-        router1 = self.manage_router(self.agent, router_info)
-
-        fip_ns_name = router1.fip_ns.name
-        self.assertTrue(self._namespace_exists(router1.fip_ns.name))
-
-        # Simulate disable router
-        self.agent._safe_router_removed(router1.router['id'])
-        self.assertFalse(self._namespace_exists(router1.ns_name))
-        self.assertTrue(self._namespace_exists(fip_ns_name))
-
-        # Simulated enable router
-        router_updated = self.manage_router(self.agent, router_info_copy)
-        self._assert_dvr_floating_ips(router_updated)
-
-    def test_dvr_router_fip_associations_exist_when_snat_removed(self):
-        """Test to validate the fip associations when snat is removed.
-
-        This test validates the fip associations when the snat is removed from
-        the agent. The fip associations should exist when the snat is moved to
-        another l3 agent.
-        """
-        self.agent.conf.agent_mode = 'dvr_snat'
-        router_info = self.generate_dvr_router_info(enable_snat=True)
-        router_info_copy = copy.deepcopy(router_info)
-        router1 = self.manage_router(self.agent, router_info)
-
-        # Remove gateway port host and the binding host_id to simulate
-        # removal of snat from l3 agent
-        router_info_copy['gw_port_host'] = ''
-        router_info_copy['gw_port']['binding:host_id'] = ''
-        router_info_copy['gw_port']['binding:vif_type'] = 'unbound'
-        router_info_copy['gw_port']['binding:vif_details'] = {}
-        self.agent._process_updated_router(router_info_copy)
-        router_updated = self.agent.router_info[router1.router['id']]
-        self._assert_dvr_floating_ips(router_updated)
-
     def test_dvr_router_with_ha_for_fip_disassociation(self):
         """Test to validate the fip rules are deleted in dvr_snat_ha router.
 
@@ -2182,3 +2134,74 @@ class TestDvrRouter(DvrRouterTestFramework, framework.L3AgentTestFramework):
                                 in fip_agent_gw_port['extra_subnets'])
         routes_cidr = set(route['cidr'] for route in routes)
         self.assertEqual(extra_subnet_cidr, routes_cidr)
+
+    def test_dvr_router_update_ecmp_routes(self):
+        self.agent.conf.agent_mode = 'dvr'
+        router_info = self.generate_dvr_router_info()
+        print(router_info)
+        router1 = self.manage_router(self.agent, router_info)
+        router1.router['routes'] = [{'destination': '20.0.10.10/32',
+                                     'nexthop': '35.4.0.11'},
+                                    {'destination': '20.0.10.10/32',
+                                     'nexthop': '35.4.0.22'},
+                                    {'destination': '20.0.10.10/32',
+                                     'nexthop': '35.4.0.33'}]
+        self.agent._process_updated_router(router1.router)
+
+        updated_route = ip_lib.list_ip_routes(
+            router1.ns_name,
+            ip_version=lib_constants.IP_VERSION_4,)
+        expected_route = [{'cidr': '20.0.10.10/32',
+                           'table': 'main',
+                           'via': [{'via': '35.4.0.11'},
+                                   {'via': '35.4.0.22'},
+                                   {'via': '35.4.0.33'}]
+                           }]
+        actual_routes = [{key: route[key] for key in expected_route[0].keys()}
+                         for route in updated_route]
+        for entry in actual_routes:
+            if entry['via']:
+                if isinstance(entry['via'], (list, tuple)):
+                    via_list = [{'via': hop['via']}
+                                for hop in entry['via']]
+                    entry['via'] = sorted(via_list, key=lambda i: i['via'])
+        self.assertIn(expected_route[0], actual_routes)
+
+        # delete one route
+        router1.router['routes'] = [{'destination': '20.0.10.10/32',
+                                     'nexthop': '35.4.0.11'},
+                                    {'destination': '20.0.10.10/32',
+                                     'nexthop': '35.4.0.22'}]
+        self.agent._process_updated_router(router1.router)
+        updated_route = ip_lib.list_ip_routes(
+            router1.ns_name,
+            ip_version=lib_constants.IP_VERSION_4, )
+        expected_route = [{'cidr': '20.0.10.10/32',
+                           'table': 'main',
+                           'via': [{'via': '35.4.0.11'},
+                                   {'via': '35.4.0.22'}]
+                           }]
+        actual_routes = [{key: route[key] for key in expected_route[0].keys()}
+                         for route in updated_route]
+        for entry in actual_routes:
+            if entry['via']:
+                if isinstance(entry['via'], (list, tuple)):
+                    via_list = [{'via': hop['via']}
+                                for hop in entry['via']]
+                    entry['via'] = sorted(via_list, key=lambda i: i['via'])
+        self.assertIn(expected_route[0], actual_routes)
+
+        # delete one route again
+        router1.router['routes'] = [{'destination': '20.0.10.10/32',
+                                     'nexthop': '35.4.0.11'}]
+        self.agent._process_updated_router(router1.router)
+        updated_route = ip_lib.list_ip_routes(
+            router1.ns_name,
+            ip_version=lib_constants.IP_VERSION_4, )
+        expected_route = [{'cidr': '20.0.10.10/32',
+                           'table': 'main',
+                           'via': '35.4.0.11'
+                           }]
+        actual_routes = [{key: route[key] for key in expected_route[0].keys()}
+                         for route in updated_route]
+        self.assertIn(expected_route[0], actual_routes)

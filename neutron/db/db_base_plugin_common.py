@@ -217,8 +217,7 @@ class DbBasePluginCommon(object):
 
     def _make_port_dict(self, port, fields=None,
                         process_extensions=True,
-                        with_fixed_ips=True,
-                        bulk=False):
+                        with_fixed_ips=True):
         mac = port["mac_address"]
         if isinstance(mac, netaddr.EUI):
             mac.dialect = netaddr.mac_unix_expanded
@@ -241,10 +240,8 @@ class DbBasePluginCommon(object):
             port_data = port
             if isinstance(port, port_obj.Port):
                 port_data = port.db_obj
-            res['bulk'] = bulk
             resource_extend.apply_funcs(
                 port_def.COLLECTION_NAME, res, port_data)
-            res.pop('bulk')
         return db_utils.resource_fields(res, fields)
 
     def _get_network(self, context, id):
@@ -262,11 +259,6 @@ class DbBasePluginCommon(object):
         except exc.NoResultFound:
             raise exceptions.SubnetNotFound(subnet_id=id)
         return subnet
-
-    def _network_exists(self, context, network_id):
-        query = model_query.query_with_hooks(
-            context, models_v2.Network, field='id')
-        return query.filter(models_v2.Network.id == network_id).first()
 
     def _get_subnet_object(self, context, id):
         subnet = subnet_obj.Subnet.get_object(context, id=id)

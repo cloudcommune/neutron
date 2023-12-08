@@ -19,7 +19,6 @@ from oslo_log import log as logging
 from oslo_utils import versionutils
 from oslo_versionedobjects import fields as obj_fields
 
-from neutron.common import _constants
 from neutron.db.models import dns as dns_models
 from neutron.db.models import l3
 from neutron.db.models import securitygroup as sg_models
@@ -416,25 +415,14 @@ class Port(base.NeutronDbObject):
                                             **kwargs)
 
     @classmethod
-    def get_auto_deletable_port_ids_and_proper_port_count_by_segment(
-            cls, context, segment_id):
-
+    def get_port_ids_filter_by_segment_id(cls, context, segment_id):
         query = context.session.query(models_v2.Port.id)
         query = query.join(
             ml2_models.PortBindingLevel,
             ml2_models.PortBindingLevel.port_id == models_v2.Port.id)
         query = query.filter(
             ml2_models.PortBindingLevel.segment_id == segment_id)
-
-        q_delete = query.filter(
-            models_v2.Port.device_owner.in_(
-                _constants.AUTO_DELETE_PORT_OWNERS))
-
-        q_proper = query.filter(
-            ~models_v2.Port.device_owner.in_(
-                _constants.AUTO_DELETE_PORT_OWNERS))
-
-        return ([r.id for r in q_delete.all()], q_proper.count())
+        return [p.id for p in query]
 
     @classmethod
     def modify_fields_to_db(cls, fields):
@@ -639,10 +627,3 @@ class Port(base.NeutronDbObject):
             query = query.filter(
                 ml2_models.PortBinding.vif_type.in_(binding_types))
         return bool(query.count())
-
-    @classmethod
-    def get_ports_allocated_by_subnet_id(cls, context, subnet_id):
-        """Return ports with fixed IPs in a subnet"""
-        return context.session.query(models_v2.Port).filter(
-            models_v2.IPAllocation.port_id == models_v2.Port.id).filter(
-            models_v2.IPAllocation.subnet_id == subnet_id).all()

@@ -71,10 +71,8 @@ class DvrEdgeRouter(dvr_local_router.DvrLocalRouter):
             if self.snat_namespace.exists():
                 LOG.debug("SNAT was rescheduled to host %s. Clearing snat "
                           "namespace.", self.router.get('gw_port_host'))
-                self.driver.unplug(interface_name,
-                                   namespace=self.snat_namespace.name,
-                                   prefix=router.EXTERNAL_DEV_PREFIX)
-                self.snat_namespace.delete()
+                return self.external_gateway_removed(
+                    ex_gw_port, interface_name)
             return
 
         if not self.snat_namespace.exists():
@@ -158,19 +156,15 @@ class DvrEdgeRouter(dvr_local_router.DvrLocalRouter):
             lib_constants.SNAT_INT_DEV_PREFIX,
             mtu=port.get('mtu'))
 
-    def initialize(self, process_monitor):
-        self._create_snat_namespace()
-        super(DvrEdgeRouter, self).initialize(process_monitor)
-
     def _create_dvr_gateway(self, ex_gw_port, gw_interface_name):
+        snat_ns = self._create_snat_namespace()
         # connect snat_ports to br_int from SNAT namespace
         for port in self.get_snat_interfaces():
             self._plug_snat_port(port)
         self._external_gateway_added(ex_gw_port, gw_interface_name,
-                                     self.snat_namespace.name,
-                                     preserve_ips=[])
+                                     snat_ns.name, preserve_ips=[])
         self.snat_iptables_manager = iptables_manager.IptablesManager(
-            namespace=self.snat_namespace.name,
+            namespace=snat_ns.name,
             use_ipv6=self.use_ipv6)
 
         self._initialize_address_scope_iptables(self.snat_iptables_manager)
@@ -180,8 +174,8 @@ class DvrEdgeRouter(dvr_local_router.DvrLocalRouter):
         # TODO(mlavalle): in the near future, this method should contain the
         # code in the L3 agent that creates a gateway for a dvr. The first step
         # is to move the creation of the snat namespace here
-        if self._is_this_snat_host():
-            self.snat_namespace.create()
+        self.snat_namespace.create()
+        return self.snat_namespace
 
     def _get_snat_int_device_name(self, port_id):
         long_name = lib_constants.SNAT_INT_DEV_PREFIX + port_id

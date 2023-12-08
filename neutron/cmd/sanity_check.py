@@ -182,6 +182,25 @@ def check_icmpv6_header_match():
     return result
 
 
+def check_vf_management():
+    result = checks.vf_management_supported()
+    if not result:
+        LOG.error('Check for VF management support failed. '
+                  'Please ensure that the version of ip link '
+                  'being used has VF support.')
+    return result
+
+
+def check_vf_extended_management():
+    result = checks.vf_extended_management_supported()
+    if not result:
+        LOG.error('Check for VF extended management support failed. '
+                  'Please ensure that the version of ip link '
+                  'being used has VF extended support: version '
+                  '"iproute2-ss140804", git tag "v3.16.0"')
+    return result
+
+
 def check_ovsdb_native():
     result = checks.ovsdb_native_supported()
     if not result:
@@ -278,15 +297,6 @@ def check_ip_nonlocal_bind():
     return result
 
 
-def check_min_tx_rate_support():
-    result = checks.min_tx_rate_support()
-    if not result:
-        LOG.warning('There are SR-IOV network interfaces that do not support '
-                    'setting the minimum TX rate (dataplane enforced minimum '
-                    'guaranteed bandwidth) "ip-link vf min_tx_rate".')
-    return result
-
-
 # Define CLI opts to test specific features, with a callback for the test
 OPTS = [
     BoolOptCallback('ovs_vxlan', check_ovs_vxlan, default=False,
@@ -305,6 +315,10 @@ OPTS = [
                     help=_('Check for ARP header match support')),
     BoolOptCallback('icmpv6_header_match', check_icmpv6_header_match,
                     help=_('Check for ICMPv6 header match support')),
+    BoolOptCallback('vf_management', check_vf_management,
+                    help=_('Check for VF management support')),
+    BoolOptCallback('vf_extended_management', check_vf_extended_management,
+                    help=_('Check for VF extended management support')),
     BoolOptCallback('read_netns', check_read_netns,
                     help=_('Check netns permission settings')),
     BoolOptCallback('dnsmasq_local_service_supported',
@@ -344,10 +358,6 @@ OPTS = [
                     help=_('Check ip_nonlocal_bind kernel option works with '
                            'network namespaces.'),
                     default=False),
-    BoolOptCallback('check_min_tx_rate_support', check_min_tx_rate_support,
-                    help=_('Check if the configured SR-IOV NICs support '
-                           'the "ip-link vf min_tx_rate" parameter.'),
-                    default=False),
 ]
 
 
@@ -357,6 +367,7 @@ def enable_tests_from_config():
     run all necessary tests, just by passing in the appropriate configs.
     """
 
+    cfg.CONF.set_default('vf_management', True)
     cfg.CONF.set_default('arp_header_match', True)
     cfg.CONF.set_default('icmpv6_header_match', True)
     if 'vxlan' in cfg.CONF.AGENT.tunnel_types:
@@ -387,6 +398,9 @@ def enable_tests_from_config():
         cfg.CONF.set_default('ipset_installed', True)
     if cfg.CONF.SECURITYGROUP.enable_security_group:
         cfg.CONF.set_default('ip6tables_installed', True)
+    if ('sriovnicswitch' in cfg.CONF.ml2.mechanism_drivers and
+            'qos' in cfg.CONF.ml2.extension_drivers):
+        cfg.CONF.set_default('vf_extended_management', True)
     if cfg.CONF.SECURITYGROUP.firewall_driver in (
         'iptables',
         'iptables_hybrid',
@@ -396,8 +410,6 @@ def enable_tests_from_config():
          'OVSHybridIptablesFirewallDriver'),
     ):
         cfg.CONF.set_default('bridge_firewalling', True)
-    if cfg.CONF.SRIOV_NIC.physical_device_mappings:
-        cfg.CONF.set_default('check_min_tx_rate_support', True)
 
 
 def all_tests_passed():

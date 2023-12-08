@@ -726,7 +726,6 @@ class BaseObjectIfaceTestCase(_BaseObjectTestCase, test_base.BaseTestCase):
         self.model_map = collections.defaultdict(list)
         self.model_map[self._test_class.db_model] = self.db_objs
         self.pager_map = collections.defaultdict(lambda: None)
-        self.extra_fields_not_in_dict = []
 
         self.get_objects_mock = mock.patch.object(
             obj_db_api, 'get_objects',
@@ -1157,11 +1156,8 @@ class BaseObjectIfaceTestCase(_BaseObjectTestCase, test_base.BaseTestCase):
         for field in self._test_class.obj_extra_fields:
             # field is accessible and cannot be set by any value
             getattr(obj, field)
-            if field in self.extra_fields_not_in_dict:
-                self.assertNotIn(field, obj.to_dict().keys())
-            else:
-                self.assertIn(field, obj.to_dict().keys())
-                self.assertRaises(AttributeError, setattr, obj, field, "1")
+            self.assertIn(field, obj.to_dict().keys())
+            self.assertRaises(AttributeError, setattr, obj, field, "1")
 
     def test_to_dict_makes_primitive_field_value(self):
         obj = self._test_class(self.context, **self.obj_fields[0])
@@ -1630,12 +1626,8 @@ class BaseDbObjectTestCase(_BaseObjectTestCase,
         self._router.create()
         return self._router['id']
 
-    def _create_test_security_group_id(self, fields=None):
+    def _create_test_security_group_id(self):
         sg_fields = self.get_random_object_fields(securitygroup.SecurityGroup)
-        fields = fields or {}
-        for field, value in ((f, v) for (f, v) in fields.items() if
-                             f in sg_fields):
-            sg_fields[field] = value
         _securitygroup = securitygroup.SecurityGroup(
             self.context, **sg_fields)
         _securitygroup.create()

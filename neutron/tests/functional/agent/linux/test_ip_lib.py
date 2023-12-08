@@ -14,7 +14,6 @@
 #    under the License.
 
 import collections
-import copy
 import itertools
 import signal
 
@@ -695,7 +694,7 @@ class IpMonitorTestCase(testscenarios.WithScenarios,
         self.proc = self._run_ip_monitor(ip_monitor)
 
     def _cleanup(self):
-        self.proc.stop(kill_timeout=10, kill_signal=signal.SIGTERM)
+        self.proc.stop(block=True, kill_signal=signal.SIGTERM)
         if self.namespace:
             priv_ip_lib.remove_netns(self.namespace)
         else:
@@ -734,7 +733,7 @@ class IpMonitorTestCase(testscenarios.WithScenarios,
                 if ip_address not in registers:
                     return False
             return True
-        except (OSError, IOError) as e:
+        except (OSError, IOError):
             return False
 
     def _check_read_file(self, ip_addresses):
@@ -815,7 +814,7 @@ class IpMonitorTestCase(testscenarios.WithScenarios,
         utils.wait_until_true(lambda: self._read_file({}), timeout=30)
         self.ip_wrapper.add_dummy(self.devices[0])
         ip_addresses = []
-        for i in range(100):
+        for i in range(250):
             _cidr = str(netaddr.IPNetwork('192.168.252.1/32').ip + i) + '/32'
             ip_addresses.append({'cidr': _cidr, 'event': 'added',
                                  'name': self.devices[0]})
@@ -823,7 +822,7 @@ class IpMonitorTestCase(testscenarios.WithScenarios,
         self._handle_ip_addresses('added', ip_addresses)
         self._check_read_file(ip_addresses)
 
-        for i in range(100):
+        for i in range(250):
             _cidr = str(netaddr.IPNetwork('192.168.252.1/32').ip + i) + '/32'
             ip_addresses.append({'cidr': _cidr, 'event': 'removed',
                                  'name': self.devices[0]})
@@ -867,8 +866,8 @@ class IpRouteCommandTestCase(functional_base.BaseSudoTestCase):
             scope = ip_lib.IP_ADDRESS_SCOPE[0]
         elif not scope:
             scope = 'global' if via else 'link'
-        if not metric:
-            metric = ip_lib.IP_ROUTE_METRIC_DEFAULT[ip_version]
+        if ip_version == constants.IP_VERSION_6 and not metric:
+            metric = 1024
         table = table or iproute_linux.DEFAULT_TABLE
         table = ip_lib.IP_RULE_TABLES_NAMES.get(table, table)
         cmp = {'table': table,
@@ -983,114 +982,3 @@ class IpRouteCommandTestCase(functional_base.BaseSudoTestCase):
             self.device.route.flush(ip_version, table=table)
             routes = self.device.route.list_routes(ip_version, table=table)
             self.assertEqual([], routes)
-
-
-class IpAddrCommandTestCase(functional_base.BaseSudoTestCase):
-
-    def setUp(self):
-        super(IpAddrCommandTestCase, self).setUp()
-        self.namespace = self.useFixture(net_helpers.NamespaceFixture()).name
-        ip_lib.IPWrapper(self.namespace).add_dummy('test_device')
-        self.device = ip_lib.IPDevice('test_device', namespace=self.namespace)
-        self.device.link.set_up()
-
-    def test_list_with_scope(self):
-        scope_ip = [
-            ('global', '192.168.100.1/24'),
-            ('global', '2001:db8::1/64'),
-            ('link', '192.168.101.1/24'),
-            ('link', 'fe80::1:1/64'),
-            ('site', 'fec0:0:0:f101::1/64'),
-            ('host', '192.168.102.1/24')]
-        for scope, _ip in scope_ip:
-            self.device.addr.add(_ip, scope=scope)
-
-        devices = self.device.addr.list()
-        devices_cidr = {device['cidr'] for device in devices}
-        for scope in scope_ip:
-            self.assertIn(scope[1], devices_cidr)
-
-        for scope, _ip in scope_ip:
-            devices_filtered = self.device.addr.list(scope=scope)
-            devices_cidr = {device['cidr'] for device in devices_filtered}
-            self.assertIn(_ip, devices_cidr)
-
-
-class GetDevicesWithIpTestCase(functional_base.BaseSudoTestCase):
-
-    def setUp(self):
-        super(GetDevicesWithIpTestCase, self).setUp()
-        self.namespace = self.useFixture(net_helpers.NamespaceFixture()).name
-        self.devices = []
-        self.num_devices = 5
-        self.num_devices_with_ip = 3
-        for idx in range(self.num_devices):
-            dev_name = 'test_device_%s' % idx
-            ip_lib.IPWrapper(self.namespace).add_dummy(dev_name)
-            device = ip_lib.IPDevice(dev_name, namespace=self.namespace)
-            device.link.set_up()
-            self.devices.append(device)
-
-        self.cidrs = [netaddr.IPNetwork('10.10.0.0/24'),
-                      netaddr.IPNetwork('10.20.0.0/24'),
-                      netaddr.IPNetwork('2001:db8:1234:1111::/64'),
-                      netaddr.IPNetwork('2001:db8:1234:2222::/64')]
-        for idx in range(self.num_devices_with_ip):
-            for cidr in self.cidrs:
-                self.devices[idx].addr.add(str(cidr.ip + idx) + '/' +
-                                           str(cidr.netmask.netmask_bits()))
-
-    @staticmethod
-    def _remove_loopback_interface(ip_addresses):
-        return [ipa for ipa in ip_addresses if
-                ipa['name'] != ip_lib.LOOPBACK_DEVNAME]
-
-    @staticmethod
-    def _remove_ipv6_scope_link(ip_addresses):
-        # Remove all IPv6 addresses with scope link (fe80::...).
-        return [ipa for ipa in ip_addresses if not (
-                ipa['scope'] == 'link' and utils.get_ip_version(ipa['cidr']))]
-
-    @staticmethod
-    def _pop_ip_address(ip_addresses, cidr):
-        for idx, ip_address in enumerate(copy.deepcopy(ip_addresses)):
-            if cidr == ip_address['cidr']:
-                ip_addresses.pop(idx)
-                return
-
-    def test_get_devices_with_ip(self):
-        ip_addresses = ip_lib.get_devices_with_ip(self.namespace)
-        ip_addresses = self._remove_loopback_interface(ip_addresses)
-        ip_addresses = self._remove_ipv6_scope_link(ip_addresses)
-        self.assertEqual(self.num_devices_with_ip * len(self.cidrs),
-                         len(ip_addresses))
-        for idx in range(self.num_devices_with_ip):
-            for cidr in self.cidrs:
-                cidr = (str(cidr.ip + idx) + '/' +
-                        str(cidr.netmask.netmask_bits()))
-                self._pop_ip_address(ip_addresses, cidr)
-
-        self.assertEqual(0, len(ip_addresses))
-
-    def test_get_devices_with_ip_name(self):
-        for idx in range(self.num_devices_with_ip):
-            dev_name = 'test_device_%s' % idx
-            ip_addresses = ip_lib.get_devices_with_ip(self.namespace,
-                                                      name=dev_name)
-            ip_addresses = self._remove_loopback_interface(ip_addresses)
-            ip_addresses = self._remove_ipv6_scope_link(ip_addresses)
-
-            for cidr in self.cidrs:
-                cidr = (str(cidr.ip + idx) + '/' +
-                        str(cidr.netmask.netmask_bits()))
-                self._pop_ip_address(ip_addresses, cidr)
-
-            self.assertEqual(0, len(ip_addresses))
-
-        for idx in range(self.num_devices_with_ip, self.num_devices):
-            dev_name = 'test_device_%s' % idx
-            ip_addresses = ip_lib.get_devices_with_ip(self.namespace,
-                                                      name=dev_name)
-            ip_addresses = self._remove_loopback_interface(ip_addresses)
-            ip_addresses = self._remove_ipv6_scope_link(ip_addresses)
-            self.assertEqual(0, len(ip_addresses))

@@ -77,11 +77,6 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
                 raise exc.InvalidAllocationPool(pool=ip_pool)
         return ip_range_pools
 
-    @staticmethod
-    def _is_distributed_service(port):
-        return (port.get('device_owner') == const.DEVICE_OWNER_DHCP and
-                port.get('device_id').startswith('ovn'))
-
     def delete_subnet(self, context, subnet_id):
         pass
 
@@ -196,8 +191,7 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             new_type.create()
         return updated_types
 
-    def update_db_subnet(self, context, subnet_id, s, oldpools,
-            subnet_obj=None):
+    def update_db_subnet(self, context, subnet_id, s, oldpools):
         changes = {}
         if "dns_nameservers" in s:
             changes['dns_nameservers'] = (
@@ -215,7 +209,7 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             changes['service_types'] = (
                 self._update_subnet_service_types(context, subnet_id, s))
 
-        subnet_obj = subnet_obj or self._get_subnet_object(context, subnet_id)
+        subnet_obj = self._get_subnet_object(context, subnet_id)
         subnet_obj.update_fields(s)
         subnet_obj.update()
         return subnet_obj, changes
@@ -648,16 +642,14 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
         return fixed_ip_list
 
     def _ipam_get_subnets(self, context, network_id, host, service_type=None,
-                          fixed_configured=False, fixed_ips=None,
-                          distributed_service=False):
+                          fixed_configured=False):
         """Return eligible subnets
 
         If no eligible subnets are found, determine why and potentially raise
         an appropriate error.
         """
         subnets = subnet_obj.Subnet.find_candidate_subnets(
-            context, network_id, host, service_type, fixed_configured,
-            fixed_ips, distributed_service=distributed_service)
+            context, network_id, host, service_type, fixed_configured)
         if subnets:
             subnet_dicts = [self._make_subnet_dict(subnet, context=context)
                             for subnet in subnets]
@@ -719,8 +711,7 @@ class IpamBackendMixin(db_base_plugin_common.DbBasePluginCommon):
             if old_ips and new_host_requested and not fixed_ips_requested:
                 valid_subnets = self._ipam_get_subnets(
                     context, old_port['network_id'], host,
-                    service_type=old_port.get('device_owner'),
-                    distributed_service=self._is_distributed_service(old_port))
+                    service_type=old_port.get('device_owner'))
                 valid_subnet_ids = {s['id'] for s in valid_subnets}
                 for fixed_ip in old_ips:
                     if fixed_ip['subnet_id'] not in valid_subnet_ids:

@@ -33,7 +33,6 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib.db import resource_extend
-from neutron_lib import exceptions as n_exc
 from neutron_lib.exceptions import placement as placement_exc
 from neutron_lib.placement import client as placement_client
 from neutron_lib.plugins import directory
@@ -44,11 +43,9 @@ from oslo_log import log
 from oslo_utils import excutils
 
 from neutron._i18n import _
-from neutron.common import ipv6_utils
 from neutron.extensions import segment
 from neutron.notifiers import batch_notifier
 from neutron.objects import network as net_obj
-from neutron.objects import ports as ports_obj
 from neutron.objects import subnet as subnet_obj
 from neutron.services.segments import db
 from neutron.services.segments import exceptions
@@ -121,7 +118,7 @@ class Plugin(db.SegmentDbMixin, segment.SegmentPluginBase):
     def _prevent_segment_delete_with_subnet_associated(
             self, resource, event, trigger, payload=None):
         """Raise exception if there are any subnets associated with segment."""
-        if payload.metadata.get(db.FOR_NET_DELETE):
+        if payload.metadata.get('for_net_delete'):
             # don't check if this is a part of a network delete operation
             return
         segment_id = payload.resource_id
@@ -134,31 +131,6 @@ class Plugin(db.SegmentDbMixin, segment.SegmentPluginBase):
                        "%s") % ", ".join(subnet_ids)
             raise exceptions.SegmentInUse(segment_id=segment_id,
                                           reason=reason)
-
-    @registry.receives(
-        resources.SUBNET, [events.PRECOMMIT_DELETE_ASSOCIATIONS])
-    def _validate_auto_address_subnet_delete(self, resource, event, trigger,
-                                             payload):
-        context = payload.context
-        subnet = subnet_obj.Subnet.get_object(context, id=payload.resource_id)
-        is_auto_addr_subnet = ipv6_utils.is_auto_address_subnet(subnet)
-        if not is_auto_addr_subnet or subnet.segment_id is None:
-            return
-
-        ports = ports_obj.Port.get_ports_allocated_by_subnet_id(context,
-                                                                subnet.id)
-        for port in ports:
-            fixed_ips = [f for f in port.fixed_ips if f.subnet_id != subnet.id]
-            if len(fixed_ips) != 0:
-                continue
-
-            LOG.info("Found port %(port_id)s, with IP auto-allocation "
-                     "only on subnet %(subnet)s which is associated with "
-                     "segment %(segment_id)s, cannot delete",
-                     {'port_id': port.id,
-                      'subnet': subnet.id,
-                      'segment_id': subnet.segment_id})
-            raise n_exc.SubnetInUse(subnet_id=subnet.id)
 
 
 class Event(object):
@@ -296,10 +268,10 @@ class NovaSegmentNotifier(object):
             total += int(netaddr.IPAddress(pool['end']) -
                          netaddr.IPAddress(pool['start'])) + 1
         if total:
-            if subnet.get('gateway_ip'):
+            if subnet['gateway_ip']:
                 total += 1
                 reserved += 1
-            if subnet.get('enable_dhcp'):
+            if subnet['enable_dhcp']:
                 reserved += 1
         return total, reserved
 
@@ -343,9 +315,6 @@ class NovaSegmentNotifier(object):
     @registry.receives(resources.SUBNET, [events.AFTER_DELETE])
     def _notify_subnet_deleted(self, resource, event, trigger, context,
                                subnet, **kwargs):
-        if kwargs.get(db.FOR_NET_DELETE):
-            return  # skip segment RP update if it is going to be deleted
-
         segment_id = subnet.get('segment_id')
         if not segment_id or subnet['ip_version'] != constants.IP_VERSION_4:
             return
@@ -362,32 +331,23 @@ class NovaSegmentNotifier(object):
                     self._delete_nova_inventory, segment_id))
 
     def _get_aggregate_id(self, segment_id):
-        try:
-            aggregate_uuid = self.p_client.list_aggregates(
-                segment_id)['aggregates'][0]
-        except placement_exc.PlacementAggregateNotFound:
-            LOG.info('Segment %s resource provider aggregate not found',
-                     segment_id)
-            return
-
-        for aggregate in self.n_client.aggregates.list():
+        aggregate_uuid = self.p_client.list_aggregates(
+            segment_id)['aggregates'][0]
+        aggregates = self.n_client.aggregates.list()
+        for aggregate in aggregates:
             nc_aggregate_uuid = self._get_nova_aggregate_uuid(aggregate)
             if nc_aggregate_uuid == aggregate_uuid:
                 return aggregate.id
 
     def _delete_nova_inventory(self, event):
         aggregate_id = self._get_aggregate_id(event.segment_id)
-        if aggregate_id:
-            aggregate = self.n_client.aggregates.get_details(aggregate_id)
-            for host in aggregate.hosts:
-                self.n_client.aggregates.remove_host(aggregate_id, host)
-            self.n_client.aggregates.delete(aggregate_id)
-
-        try:
-            self.p_client.delete_resource_provider(event.segment_id)
-        except placement_exc.PlacementClientError as exc:
-            LOG.info('Segment %s resource provider not found; error: %s',
-                     event.segment_id, str(exc))
+        aggregate = self.n_client.aggregates.get_details(
+            aggregate_id)
+        for host in aggregate.hosts:
+            self.n_client.aggregates.remove_host(aggregate_id,
+                                                 host)
+        self.n_client.aggregates.delete(aggregate_id)
+        self.p_client.delete_resource_provider(event.segment_id)
 
     @registry.receives(resources.SEGMENT_HOST_MAPPING, [events.AFTER_CREATE])
     def _notify_host_addition_to_aggregate(self, resource, event, trigger,
@@ -402,8 +362,9 @@ class NovaSegmentNotifier(object):
 
     def _add_host_to_aggregate(self, event):
         for segment_id in event.segment_ids:
-            aggregate_id = self._get_aggregate_id(segment_id)
-            if not aggregate_id:
+            try:
+                aggregate_id = self._get_aggregate_id(segment_id)
+            except placement_exc.PlacementAggregateNotFound:
                 LOG.info('When adding host %(host)s, aggregate not found '
                          'for routed network segment %(segment_id)s',
                          {'host': event.host, 'segment_id': segment_id})
@@ -482,13 +443,6 @@ class NovaSegmentNotifier(object):
                     ip['ip_address']).version == constants.IP_VERSION_4:
                 ipv4_subnet_ids.append(ip['subnet_id'])
         return ipv4_subnet_ids
-
-    @registry.receives(resources.SEGMENT, [events.AFTER_DELETE])
-    def _notify_segment_deleted(
-            self, resource, event, trigger, payload=None):
-        if payload:
-            self.batch_notifier.queue_event(Event(
-                self._delete_nova_inventory, payload.resource_id))
 
 
 @registry.has_registry_receivers
@@ -619,7 +573,7 @@ class SegmentHostRoutes(object):
                 context=context,
                 ip_version=netaddr.IPNetwork(subnet['cidr']).version,
                 network_id=subnet['network_id'],
-                segment_id=segment_id,
+                segment_id=subnet['segment_id'],
                 host_routes=copy.deepcopy(host_routes),
                 gateway_ip=gateway_ip)
             if (not host_routes or
@@ -631,14 +585,11 @@ class SegmentHostRoutes(object):
     def host_routes_before_update(self, resource, event, trigger, **kwargs):
         context = kwargs['context']
         subnet, original_subnet = kwargs['request'], kwargs['original_subnet']
-        orig_segment_id = original_subnet.get('segment_id')
-        segment_id = subnet.get('segment_id', orig_segment_id)
-        orig_gateway_ip = original_subnet.get('gateway_ip')
-        gateway_ip = subnet.get('gateway_ip', orig_gateway_ip)
-        orig_host_routes = original_subnet.get('host_routes')
-        host_routes = subnet.get('host_routes', orig_host_routes)
-        if (segment_id and (host_routes != orig_host_routes or
-                            gateway_ip != orig_gateway_ip)):
+        segment_id = subnet.get('segment_id', original_subnet['segment_id'])
+        gateway_ip = subnet.get('gateway_ip', original_subnet['gateway_ip'])
+        host_routes = subnet.get('host_routes', original_subnet['host_routes'])
+        if (segment_id and (host_routes != original_subnet['host_routes'] or
+                            gateway_ip != original_subnet['gateway_ip'])):
             calc_host_routes = self._calculate_routed_network_host_routes(
                 context=context,
                 ip_version=netaddr.IPNetwork(original_subnet['cidr']).version,
@@ -646,8 +597,8 @@ class SegmentHostRoutes(object):
                 segment_id=segment_id,
                 host_routes=copy.deepcopy(host_routes),
                 gateway_ip=gateway_ip,
-                old_gateway_ip=orig_gateway_ip if (
-                        gateway_ip != orig_gateway_ip) else None)
+                old_gateway_ip=original_subnet['gateway_ip'] if (
+                        gateway_ip != original_subnet['gateway_ip']) else None)
             if self._host_routes_need_update(host_routes, calc_host_routes):
                 subnet['host_routes'] = calc_host_routes
 
@@ -668,9 +619,6 @@ class SegmentHostRoutes(object):
                                  subnet, **kwargs):
         # If this is a routed network, remove any routes to this subnet on
         # this networks remaining subnets.
-        if kwargs.get(db.FOR_NET_DELETE):
-            return  # skip subnet update if the network is going to be deleted
-
         if subnet.get('segment_id'):
             self._update_routed_network_host_routes(
                 context, subnet['network_id'], deleted_cidr=subnet['cidr'])

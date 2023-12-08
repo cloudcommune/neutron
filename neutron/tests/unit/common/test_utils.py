@@ -544,13 +544,13 @@ class TimerTestCase(base.BaseTestCase):
     def test__getattr(self):
         with utils.Timer() as timer:
             time.sleep(1)
-        self.assertLess(timer.total_seconds(), 2)
+        self.assertEqual(1, round(timer.total_seconds(), 0))
         self.assertEqual(1, timer.delta.seconds)
 
     def test__enter_with_timeout(self):
         with utils.Timer(timeout=10) as timer:
             time.sleep(1)
-        self.assertLess(timer.total_seconds(), 2)
+        self.assertEqual(1, round(timer.total_seconds(), 0))
 
     def test__enter_with_timeout_exception(self):
         msg = r'Timer timeout expired after 1 second\(s\).'
@@ -624,21 +624,3 @@ class SpawnWithOrWithoutProfilerTestCase(
 
     def test_spawn_without_profiler(self):
         self._compare_profilers_in_parent_and_in_child(init_profiler=False)
-
-
-@utils.SingletonDecorator
-class _TestSingletonClass(object):
-
-    def __init__(self):
-        self.variable = None
-
-
-class SingletonDecoratorTestCase(base.BaseTestCase):
-
-    def test_singleton_instance_class(self):
-        instance_1 = _TestSingletonClass()
-        instance_1.variable = 'value1'
-
-        instance_2 = _TestSingletonClass()
-        self.assertEqual(instance_1.__hash__(), instance_2.__hash__())
-        self.assertEqual('value1', instance_2.variable)

@@ -41,7 +41,6 @@ from neutron.common import config as common_config
 from neutron.common import profiler as setup_profiler
 from neutron.common import utils
 from neutron.conf.agent import common as agent_config
-from neutron.conf import service as service_conf
 from neutron.plugins.ml2.drivers.agent import _agent_manager_base as amb
 from neutron.plugins.ml2.drivers.agent import _common_agent as ca
 from neutron.plugins.ml2.drivers.agent import config as cagt_config  # noqa
@@ -398,8 +397,7 @@ class LinuxBridgeManager(amb.CommonAgentManagerBase):
         if gateway:
             # Ensure that the gateway can be updated by changing the metric
             metric = 100
-            ip_version = utils.get_ip_version(gateway['cidr'])
-            if gateway['metric'] != ip_lib.IP_ROUTE_METRIC_DEFAULT[ip_version]:
+            if 'metric' in gateway:
                 metric = gateway['metric'] - 1
             dst_device.route.add_gateway(gateway=gateway['via'],
                                          metric=metric)
@@ -1032,8 +1030,6 @@ def main():
 
     common_config.setup_logging()
     agent_config.setup_privsep()
-    service_conf.register_service_opts(service_conf.RPC_EXTRA_OPTS, cfg.CONF)
-
     try:
         interface_mappings = helpers.parse_mappings(
             cfg.CONF.LINUX_BRIDGE.physical_interface_mappings)

@@ -14,7 +14,6 @@
 
 import netaddr
 from neutron_lib.api.definitions import port as port_def
-from neutron_lib.api import extensions
 from neutron_lib.api import validators
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import exceptions
@@ -27,7 +26,6 @@ from neutron_lib.db import model_query
 from neutron_lib.db import resource_extend
 from neutron_lib.db import utils as db_utils
 from neutron_lib import exceptions as n_exc
-from neutron_lib.objects import exceptions as obj_exc
 from neutron_lib.utils import helpers
 from neutron_lib.utils import net
 from oslo_log import log as logging
@@ -47,8 +45,6 @@ from neutron import quota
 
 
 LOG = logging.getLogger(__name__)
-
-DEFAULT_SG_DESCRIPTION = _('Default security group')
 
 
 @resource_extend.has_resource_extenders
@@ -275,7 +271,6 @@ class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase,
             sg.delete()
 
         kwargs.pop('security_group')
-        kwargs['name'] = sg['name']
         registry.notify(resources.SECURITY_GROUP, events.AFTER_DELETE,
                         self, **kwargs)
 
@@ -710,19 +705,6 @@ class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase,
         pager = base_obj.Pager(
             sorts=sorts, marker=marker, limit=limit, page_reverse=page_reverse)
 
-        project_id = filters.get('project_id') or filters.get('tenant_id')
-        if project_id:
-            project_id = project_id[0]
-        else:
-            project_id = context.project_id
-        if project_id:
-            self._ensure_default_security_group(context, project_id)
-
-        if not filters and context.project_id and not context.is_admin:
-            rule_ids = sg_obj.SecurityGroupRule.get_security_group_rule_ids(
-                context.project_id)
-            filters = {'id': rule_ids}
-
         # NOTE(slaweq): use admin context here to be able to get all rules
         # which fits filters' criteria. Later in policy engine rules will be
         # filtered and only those which are allowed according to policy will
@@ -832,8 +814,6 @@ class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase,
 
         :returns: the default security group id for given tenant.
         """
-        if not extensions.is_extension_supported(self, 'security-group'):
-            return
         default_group_id = self._get_default_sg_id(context, tenant_id)
         if default_group_id:
             return default_group_id
@@ -842,13 +822,10 @@ class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase,
             'security_group':
                 {'name': 'default',
                  'tenant_id': tenant_id,
-                 'description': DEFAULT_SG_DESCRIPTION}
+                 'description': _('Default security group')}
         }
-        try:
-            return self.create_security_group(context, security_group,
-                                              default_sg=True)['id']
-        except obj_exc.NeutronDbObjectDuplicateEntry:
-            return self._get_default_sg_id(context, tenant_id)
+        return self.create_security_group(context, security_group,
+                                          default_sg=True)['id']
 
     def _get_security_groups_on_port(self, context, port):
         """Check that all security groups on port belong to tenant.
@@ -868,8 +845,7 @@ class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase,
 
         valid_groups = set(
             g.id for g in sg_objs
-            if (context.is_admin or not tenant_id or
-                g.tenant_id == tenant_id or
+            if (not tenant_id or g.tenant_id == tenant_id or
                 sg_obj.SecurityGroup.is_shared_with_tenant(
                     context, g.id, tenant_id))
         )
@@ -891,8 +867,7 @@ class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase,
             port_project = port.get('tenant_id')
             default_sg = self._ensure_default_security_group(context,
                                                              port_project)
-            if default_sg:
-                port[ext_sg.SECURITYGROUPS] = [default_sg]
+            port[ext_sg.SECURITYGROUPS] = [default_sg]
 
     def _check_update_deletes_security_groups(self, port):
         """Return True if port has as a security group and it's value

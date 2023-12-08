@@ -17,27 +17,24 @@
 
 import signal
 import sys
-import threading
 
+import eventlet
+from eventlet import queue
 from oslo_serialization import jsonutils
-from six.moves import queue
 
 from neutron.agent.linux import ip_lib
 
 
-EVENT_STOP = threading.Event()
-EVENT_STARTED = threading.Event()
-IP_MONITOR = None
-READ_QUEUE = None
+EVENT_STOP = eventlet.Event()
+EVENT_STARTED = eventlet.Event()
+POOL = eventlet.GreenPool(2)
 
 
 def sigterm_handler(_signo, _stack_frame):
     global EVENT_STOP
-    global IP_MONITOR
-    global READ_QUEUE
-    EVENT_STOP.set()
-    IP_MONITOR.join()
-    READ_QUEUE.join()
+    global POOL
+    EVENT_STOP.send()
+    POOL.waitall()
     exit(0)
 
 
@@ -48,10 +45,11 @@ def read_queue(temp_file, _queue, event_stop, event_started):
     event_started.wait()
     with open(temp_file, 'w') as f:
         f.write('')
-    while not event_stop.is_set():
+    while not event_stop.ready():
+        eventlet.sleep(0)
         try:
-            retval = _queue.get(timeout=1)
-        except queue.Empty:
+            retval = _queue.get(timeout=2)
+        except eventlet.queue.Empty:
             retval = None
         if retval:
             with open(temp_file, 'a+') as f:
@@ -59,19 +57,12 @@ def read_queue(temp_file, _queue, event_stop, event_started):
 
 
 def main(temp_file, namespace):
-    global IP_MONITOR
-    global READ_QUEUE
+    global POOL
     namespace = None if namespace == 'None' else namespace
     _queue = queue.Queue()
-    IP_MONITOR = threading.Thread(
-        target=ip_lib.ip_monitor,
-        args=(namespace, _queue, EVENT_STOP, EVENT_STARTED))
-    IP_MONITOR.start()
-    READ_QUEUE = threading.Thread(
-        target=read_queue,
-        args=(temp_file, _queue, EVENT_STOP, EVENT_STARTED))
-    READ_QUEUE.start()
-    READ_QUEUE.join()
+    POOL.spawn(ip_lib.ip_monitor, namespace, _queue, EVENT_STOP, EVENT_STARTED)
+    POOL.spawn(read_queue, temp_file, _queue, EVENT_STOP, EVENT_STARTED)
+    POOL.waitall()
 
 
 if __name__ == "__main__":

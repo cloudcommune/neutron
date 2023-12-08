@@ -186,26 +186,6 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
             self.br.db_get_val('Bridge', self.br.br_name, 'protocols'),
             ['OpenFlow10', 'OpenFlow12', 'OpenFlow13'])
 
-    def _test_set_igmp_snooping_state(self, state):
-        self.br.set_igmp_snooping_state(state)
-        self.assertEqual(
-            state,
-            self.br.db_get_val(
-                'Bridge', self.br.br_name, 'mcast_snooping_enable'))
-        br_other_config = self.ovs.ovsdb.db_find(
-            'Bridge', ('name', '=', self.br.br_name), columns=['other_config']
-        ).execute()[0]['other_config']
-        self.assertEqual(
-            'false',
-            br_other_config.get(
-                'mcast-snooping-disable-flood-unregistered', '').lower())
-
-    def test_set_igmp_snooping_enabled(self):
-        self._test_set_igmp_snooping_state(True)
-
-    def test_set_igmp_snooping_disabled(self):
-        self._test_set_igmp_snooping_state(False)
-
     def test_get_datapath_id(self):
         brdev = ip_lib.IPDevice(self.br.br_name)
         dpid = brdev.link.attributes['link/ether'].replace(':', '')
@@ -213,12 +193,11 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
                                  self.br.br_name, 'datapath_id', dpid)
         self.assertIn(dpid, self.br.get_datapath_id())
 
-    def _test_add_tunnel_port(self, attrs,
-                              expected_tunnel_type=const.TYPE_GRE):
+    def _test_add_tunnel_port(self, attrs):
         port_name = utils.get_rand_device_name(net_helpers.PORT_PREFIX)
         self.br.add_tunnel_port(port_name, attrs['remote_ip'],
                                 attrs['local_ip'])
-        self.assertEqual(expected_tunnel_type,
+        self.assertEqual('gre',
                          self.ovs.db_get_val('Interface', port_name, 'type'))
         options = self.ovs.db_get_val('Interface', port_name, 'options')
         for attr, val in attrs.items():
@@ -235,10 +214,8 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
         attrs = {
             'remote_ip': '2001:db8:200::1',
             'local_ip': '2001:db8:100::1',
-            'packet_type': 'legacy_l2',
         }
-        self._test_add_tunnel_port(
-            attrs, expected_tunnel_type=ovs_lib.TYPE_GRE_IP6)
+        self._test_add_tunnel_port(attrs)
 
     def test_add_tunnel_port_custom_port(self):
         port_name = utils.get_rand_device_name(net_helpers.PORT_PREFIX)
@@ -487,12 +464,11 @@ class OVSBridgeTestCase(OVSBridgeTestBase):
 
     def test_db_add_set(self):
         protocols = ["OpenFlow10", "OpenFlow11"]
-        expected = self.br.initial_protocols.union(protocols)
         self.br.ovsdb.db_add("Bridge", self.br.br_name, "protocols",
                              *protocols).execute(check_error=True)
-        self.assertItemsEqual(expected,
-                              self.br.db_get_val('Bridge',
-                                                 self.br.br_name, "protocols"))
+        self.assertEqual(protocols,
+                         self.br.db_get_val('Bridge',
+                                            self.br.br_name, "protocols"))
 
     def test_db_add_map(self):
         key = "testdata"

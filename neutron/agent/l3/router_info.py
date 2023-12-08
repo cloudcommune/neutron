@@ -20,6 +20,8 @@ from neutron_lib import constants as lib_constants
 from neutron_lib.exceptions import l3 as l3_exc
 from neutron_lib.utils import helpers
 from oslo_log import log as logging
+from pyroute2.netlink import exceptions \
+    as pyroute2_exc  # pylint: disable=no-name-in-module
 import six
 
 from neutron._i18n import _
@@ -27,7 +29,6 @@ from neutron.agent.l3 import namespaces
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import iptables_manager
 from neutron.agent.linux import ra
-from neutron.common import coordination
 from neutron.common import ipv6_utils
 from neutron.common import utils as common_utils
 from neutron.ipam import utils as ipam_utils
@@ -41,6 +42,9 @@ ADDRESS_SCOPE_MARK_MASK = "0xffff0000"
 ADDRESS_SCOPE_MARK_ID_MIN = 1024
 ADDRESS_SCOPE_MARK_ID_MAX = 2048
 DEFAULT_ADDRESS_SCOPE = "noscope"
+
+ARP_PROXY_ON = 1
+ARP_PROXY_OFF = 0
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -151,6 +155,7 @@ class RouterInfo(BaseRouterInfo):
         self.initialize_address_scope_iptables()
         self.initialize_metadata_iptables()
         self.routes = []
+        self.portforwardings = []
         # radvd is a neutron.agent.linux.ra.DaemonMonitor
         self.radvd = None
         self.centralized_port_forwarding_fip_set = set()
@@ -182,22 +187,100 @@ class RouterInfo(BaseRouterInfo):
         ip_wrapper.netns.execute(cmd, check_exit_code=False)
 
     def update_routing_table(self, operation, route):
+        # if this function called from subclass, We should
+        # not write route by ip command
+        if hasattr(self, 'ha_port'):
+            return
         self._update_routing_table(operation, route, self.ns_name)
+
+    def update_routing_table_ecmp(self, route_list):
+        multipath = [dict(via=route['nexthop'])
+                     for route in route_list]
+        try:
+            ip_lib.add_ip_route(self.ns_name, route_list[0]['destination'],
+                                via=multipath)
+        except (RuntimeError, OSError, pyroute2_exc.NetlinkError):
+            pass
+
+    def _set_arp_proxy(self, port, operation):
+        qr_name = self.get_internal_device_name(port['id'])
+        LOG.debug('Setting ARP proxy on %s', qr_name)
+        ip_wrapper = ip_lib.IPWrapper(namespace=self.ns_name)
+        cmd = ['sysctl', '-w', 'net.ipv4.conf.%s.proxy_arp=%d' %
+               (qr_name, operation)]
+        ip_wrapper.netns.execute(cmd, check_exit_code=False)
+        cmd = ['sysctl', '-w', 'net.ipv4.conf.%s.proxy_arp_pvlan=%d' %
+               (qr_name, operation)]
+        ip_wrapper.netns.execute(cmd, check_exit_code=False)
+
+    def set_arp_proxy_for_ecmp(self, destination, operation):
+        dst_ip = netaddr.IPNetwork(destination)
+        for port in self.internal_ports:
+            for subnet in port['subnets']:
+                port_subnet = [subnet['cidr']]
+                if dst_ip in netaddr.IPSet(port_subnet):
+                    self._set_arp_proxy(port, operation)
+
+    def check_and_remove_ecmp_route(self, old_routes, remove_route):
+        route_list = []
+        for route in old_routes:
+            if route['destination'] == remove_route['destination']:
+                route_list.append(route)
+        # An ECMP route is composed of multiple routes with the same
+        # destination address, and two scenarios should be considered
+        # when removing a nexthop address from an ECMP route.
+        # a. The original ECMP route has only two nexthops, deleting
+        #    one of them will make it a normal route.
+        # b. The original ECMP route has more than two nexthops,
+        #    delete one of the nexthops, it is still an ECMP route.
+        if len(route_list) == 2:
+            for r in route_list:
+                if r['nexthop'] != remove_route['nexthop']:
+                    self.update_routing_table('replace', r)
+            self.set_arp_proxy_for_ecmp(remove_route['destination'],
+                                        ARP_PROXY_OFF)
+            return True
+
+        if len(route_list) > 2:
+            route_list.remove(remove_route)
+            self.update_routing_table_ecmp(route_list)
+            return True
+
+        return False
+
+    def check_and_add_ecmp_route(self, old_routes, new_route):
+        route_list = []
+        for route in old_routes:
+            if route['destination'] == new_route['destination']:
+                route_list.append(route)
+
+        if route_list:
+            route_list.append(new_route)
+            self.update_routing_table_ecmp(route_list)
+            self.set_arp_proxy_for_ecmp(new_route['destination'],
+                                        ARP_PROXY_ON)
+            return True
+
+        return False
 
     def routes_updated(self, old_routes, new_routes):
         adds, removes = helpers.diff_list_of_dict(old_routes,
                                                   new_routes)
-        for route in adds:
-            LOG.debug("Added route entry is '%s'", route)
-            # remove replaced route from deleted route
-            for del_route in removes:
-                if route['destination'] == del_route['destination']:
-                    removes.remove(del_route)
-            # replace success even if there is no existing route
-            self.update_routing_table('replace', route)
         for route in removes:
-            LOG.debug("Removed route entry is '%s'", route)
-            self.update_routing_table('delete', route)
+            # Judge if modifying an ECMP route or not, if not,
+            # just delete it, if it is, replace it
+            # update old_routes after modify
+            if not self.check_and_remove_ecmp_route(old_routes, route):
+                LOG.debug("Removed route entry is '%s'", route)
+                self.update_routing_table('delete', route)
+            old_routes.remove(route)
+
+        for route in adds:
+            if not self.check_and_add_ecmp_route(old_routes, route):
+                LOG.debug("Added route entry is '%s'", route)
+                # replace success even if there is no existing route
+                self.update_routing_table('replace', route)
+            old_routes.append(route)
 
     def get_floating_ips(self):
         """Filter Floating IPs to be hosted on this agent."""
@@ -625,7 +708,7 @@ class RouterInfo(BaseRouterInfo):
             for subnet in p['subnets']:
                 if ipv6_utils.is_ipv6_pd_enabled(subnet):
                     self.agent.pd.disable_subnet(self.router_id, subnet['id'])
-                    self.pd_subnets.pop(subnet['id'], None)
+                    del self.pd_subnets[subnet['id']]
 
         for p in new_ports:
             self.internal_network_added(p)
@@ -697,16 +780,14 @@ class RouterInfo(BaseRouterInfo):
         return [common_utils.ip_to_cidr(ip['floating_ip_address'])
                 for ip in floating_ips]
 
-    def _plug_external_gateway(self, ex_gw_port, interface_name, ns_name,
-                               link_up=True):
+    def _plug_external_gateway(self, ex_gw_port, interface_name, ns_name):
         self.driver.plug(ex_gw_port['network_id'],
                          ex_gw_port['id'],
                          interface_name,
                          ex_gw_port['mac_address'],
                          namespace=ns_name,
                          prefix=EXTERNAL_DEV_PREFIX,
-                         mtu=ex_gw_port.get('mtu'),
-                         link_up=link_up)
+                         mtu=ex_gw_port.get('mtu'))
 
     def _get_external_gw_ips(self, ex_gw_port):
         gateway_ips = []
@@ -766,11 +847,7 @@ class RouterInfo(BaseRouterInfo):
         LOG.debug("External gateway added: port(%s), interface(%s), ns(%s)",
                   ex_gw_port, interface_name, ns_name)
         self._plug_external_gateway(ex_gw_port, interface_name, ns_name)
-        self._external_gateway_settings(ex_gw_port, interface_name,
-                                        ns_name, preserve_ips)
 
-    def _external_gateway_settings(self, ex_gw_port, interface_name,
-                                   ns_name, preserve_ips):
         # Build up the interface and gateway IP addresses that
         # will be added to the interface.
         ip_cidrs = common_utils.fixed_ip_cidrs(ex_gw_port['fixed_ips'])
@@ -815,19 +892,17 @@ class RouterInfo(BaseRouterInfo):
         return any(netaddr.IPAddress(gw_ip).version == 6
                    for gw_ip in gateway_ips)
 
-    def get_router_preserve_ips(self):
+    def external_gateway_added(self, ex_gw_port, interface_name):
         preserve_ips = self._list_floating_ip_cidrs() + list(
             self.centralized_port_forwarding_fip_set)
         preserve_ips.extend(self.agent.pd.get_preserve_ips(self.router_id))
-        return preserve_ips
-
-    def external_gateway_added(self, ex_gw_port, interface_name):
-        preserve_ips = self.get_router_preserve_ips()
         self._external_gateway_added(
             ex_gw_port, interface_name, self.ns_name, preserve_ips)
 
     def external_gateway_updated(self, ex_gw_port, interface_name):
-        preserve_ips = self.get_router_preserve_ips()
+        preserve_ips = self._list_floating_ip_cidrs() + list(
+            self.centralized_port_forwarding_fip_set)
+        preserve_ips.extend(self.agent.pd.get_preserve_ips(self.router_id))
         self._external_gateway_added(
             ex_gw_port, interface_name, self.ns_name, preserve_ips)
 
@@ -984,7 +1059,6 @@ class RouterInfo(BaseRouterInfo):
         finally:
             self.update_fip_statuses(fip_statuses)
 
-    @coordination.synchronized('router-lock-ns-{self.ns_name}')
     def process_external(self):
         fip_statuses = {}
         try:
@@ -1193,7 +1267,6 @@ class RouterInfo(BaseRouterInfo):
             self.get_address_scope_mark_mask(address_scope))
         iptables_manager.ipv4['nat'].add_rule('snat', rule)
 
-    @coordination.synchronized('router-lock-ns-{self.ns_name}')
     def process_address_scope(self):
         with self.iptables_manager.defer_apply():
             self.process_ports_address_scope_iptables()

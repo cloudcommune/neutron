@@ -1490,33 +1490,6 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
                                                   None,
                                                   p['port']['id'])
 
-    def test_update_router_interface_port_ipv6_subnet_ext_ra(self):
-        use_cases = [{'msg': 'IPv6 Subnet Modes (none, slaac)',
-                      'ra_mode': None,
-                      'address_mode': lib_constants.IPV6_SLAAC},
-                     {'msg': 'IPv6 Subnet Modes (none, dhcpv6-stateful)',
-                      'ra_mode': None,
-                      'address_mode': lib_constants.DHCPV6_STATEFUL},
-                     {'msg': 'IPv6 Subnet Modes (none, dhcpv6-stateless)',
-                      'ra_mode': None,
-                      'address_mode': lib_constants.DHCPV6_STATELESS}]
-        for uc in use_cases:
-            with self.network() as network, self.router() as router:
-                with self.subnet(
-                        network=network, cidr='fd00::/64',
-                        ip_version=lib_constants.IP_VERSION_6,
-                        ipv6_ra_mode=uc['ra_mode'],
-                        ipv6_address_mode=uc['address_mode']) as subnet:
-                    fixed_ips = [{'subnet_id': subnet['subnet']['id']}]
-                    with self.port(subnet=subnet, fixed_ips=fixed_ips) as port:
-                        self._router_interface_action(
-                            'add',
-                            router['router']['id'],
-                            None,
-                            port['port']['id'],
-                            expected_code=exc.HTTPBadRequest.code,
-                            msg=uc['msg'])
-
     def _assert_body_port_id_and_update_port(self, body, mock_update_port,
                                              port_id, device_id):
         self.assertNotIn('port_id', body)
@@ -1753,61 +1726,18 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
                                                   HTTPBadRequest.code)
 
     def test_router_add_interface_cidr_overlapped_with_gateway(self):
-        with self.router() as r, self.network() as ext_net:
+        with self.router() as r:
             with self.subnet(cidr='10.0.1.0/24') as s1, self.subnet(
-                    network=ext_net, cidr='10.0.0.0/16') as s2:
-                ext_net_id = ext_net['network']['id']
-                self._set_net_external(ext_net_id)
+                    cidr='10.0.0.0/16') as s2:
+                self._set_net_external(s2['subnet']['network_id'])
                 self._add_external_gateway_to_router(
-                    r['router']['id'], ext_net_id)
-                res = self._router_interface_action(
-                    'add', r['router']['id'], s1['subnet']['id'], None,
-                    expected_code=exc.HTTPBadRequest.code)
-                expected_msg = ("Bad router request: Cidr 10.0.1.0/24 of "
-                                "subnet %(internal_subnet_id)s overlaps with "
-                                "cidr 10.0.0.0/16 of subnet "
-                                "%(external_subnet_id)s.") % {
-                                    "external_subnet_id": s2['subnet']['id'],
-                                    "internal_subnet_id": s1['subnet']['id']}
-                self.assertEqual(expected_msg, res['NeutronError']['message'])
-
-                # External network have multiple subnets.
-                with self.subnet(network=ext_net,
-                                 cidr='192.168.1.0/24') as s3, \
-                        self.subnet(cidr='192.168.1.0/24') as s4:
-                    res = self._router_interface_action(
-                        'add', r['router']['id'], s4['subnet']['id'], None,
-                        expected_code=exc.HTTPBadRequest.code)
-                    expected_msg = (
-                        "Bad router request: Cidr 192.168.1.0/24 of subnet "
-                        "%(internal_subnet_id)s overlaps with cidr "
-                        "192.168.1.0/24 of subnet %(external_subnet_id)s.") % {
-                            "external_subnet_id": s3['subnet']['id'],
-                            "internal_subnet_id": s4['subnet']['id']}
-                    self.assertEqual(expected_msg,
-                                     res['NeutronError']['message'])
-
-    def test_router_set_gateway_cidr_overlapped_with_subnets(self):
-        with self.router() as r, self.network() as ext_net:
-            with self.subnet(network=ext_net, cidr='10.0.1.0/24') as s1, \
-                    self.subnet(network=ext_net, cidr='10.0.2.0/24') as s2, \
-                    self.subnet(cidr='10.0.2.0/24') as s3:
-                ext_net_id = ext_net['network']['id']
-                self._set_net_external(ext_net_id)
-                self._router_interface_action(
-                    'add', r['router']['id'],
-                    s3['subnet']['id'], None)
-                res = self._add_external_gateway_to_router(
-                    r['router']['id'], ext_net_id,
-                    ext_ips=[{'subnet_id': s1['subnet']['id']}],
-                    expected_code=exc.HTTPBadRequest.code)
-                expected_msg = (
-                    "Bad router request: Cidr 10.0.2.0/24 of subnet "
-                    "%(external_subnet_id)s overlaps with cidr 10.0.2.0/24 of "
-                    "subnet %(internal_subnet_id)s.") % {
-                        "external_subnet_id": s2["subnet"]["id"],
-                        "internal_subnet_id": s3["subnet"]["id"]}
-                self.assertEqual(expected_msg, res['NeutronError']['message'])
+                    r['router']['id'],
+                    s2['subnet']['network_id'])
+                res = self._router_interface_action('add',
+                                                    r['router']['id'],
+                                                    s1['subnet']['id'],
+                                                    None)
+                self.assertIn('port_id', res)
 
     def test_router_add_interface_by_port_cidr_overlapped_with_gateway(self):
         with self.router() as r:
@@ -1819,17 +1749,11 @@ class L3NatTestCaseBase(L3NatTestCaseMixin):
                         r['router']['id'],
                         s2['subnet']['network_id'])
 
-                    res = self._router_interface_action(
-                        'add', r['router']['id'], None, p['port']['id'],
-                        expected_code=exc.HTTPBadRequest.code)
-                    expected_msg = (
-                        "Bad router request: Cidr 10.0.1.0/24 of subnet "
-                        "%(internal_subnet_id)s overlaps with cidr "
-                        "10.0.0.0/16 of subnet %(external_subnet_id)s.") % {
-                            "external_subnet_id": s2['subnet']['id'],
-                            "internal_subnet_id": s1['subnet']['id']}
-                    self.assertEqual(expected_msg,
-                                     res['NeutronError']['message'])
+                    res = self._router_interface_action('add',
+                                                        r['router']['id'],
+                                                        None,
+                                                        p['port']['id'])
+                    self.assertIn('port_id', res)
 
     def test_router_add_gateway_dup_subnet1_returns_400(self):
         with self.router() as r:

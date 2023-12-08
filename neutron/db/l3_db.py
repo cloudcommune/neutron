@@ -106,15 +106,6 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
             l3plugin.prevent_l3_port_deletion(
                 payload.context, payload.resource_id)
 
-    @staticmethod
-    def _validate_subnet_address_mode(subnet):
-        if (subnet['ip_version'] == 6 and subnet['ipv6_ra_mode'] is None and
-                subnet['ipv6_address_mode'] is not None):
-            msg = (_('IPv6 subnet %s configured to receive RAs from an '
-                   'external router cannot be added to Neutron Router.') %
-                   subnet['id'])
-            raise n_exc.BadRequest(resource='router', msg=msg)
-
     @property
     def _is_dns_integration_supported(self):
         if self._dns_integration is None:
@@ -427,7 +418,8 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
 
             self._check_for_dup_router_subnets(context, router,
                                                new_network_id,
-                                               subnets)
+                                               subnets,
+                                               include_gateway=True)
             self._create_router_gw_port(context, router,
                                         new_network_id, ext_ips)
 
@@ -552,7 +544,8 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
                                                 filters=filters)
 
     def _check_for_dup_router_subnets(self, context, router,
-                                      network_id, new_subnets):
+                                      network_id, new_subnets,
+                                      include_gateway=False):
         # It's possible these ports are on the same network, but
         # different subnets.
         new_subnet_ids = {s['id'] for s in new_subnets}
@@ -563,13 +556,8 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
                     msg = (_("Router already has a port on subnet %s")
                            % ip['subnet_id'])
                     raise n_exc.BadRequest(resource='router', msg=msg)
-                if p.get('device_owner') == DEVICE_OWNER_ROUTER_GW:
-                    ext_subts = self._core_plugin.get_subnets(
-                        context.elevated(),
-                        filters={'network_id': [p['network_id']]})
-                    for sub in ext_subts:
-                        router_subnets.append(sub['id'])
-                else:
+                gw_owner = (p.get('device_owner') == DEVICE_OWNER_ROUTER_GW)
+                if include_gateway == gw_owner:
                     router_subnets.append(ip['subnet_id'])
 
         # Ignore temporary Prefix Delegation CIDRs
@@ -639,13 +627,6 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
         if not port['fixed_ips']:
             msg = _('Router port must have at least one fixed IP')
             raise n_exc.BadRequest(resource='router', msg=msg)
-
-        fixed_ips = [ip for ip in port['fixed_ips']]
-        for fixed_ip in fixed_ips:
-            subnet = self._core_plugin.get_subnet(
-                context, fixed_ip['subnet_id'])
-            self._validate_subnet_address_mode(subnet)
-
         return port
 
     def _validate_port_in_range_or_admin(self, context, subnets, port):
@@ -770,7 +751,12 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
             msg = (_('Cannot add interface to router because subnet %s is not '
                      'owned by project making the request') % subnet_id)
             raise n_exc.BadRequest(resource='router', msg=msg)
-        self._validate_subnet_address_mode(subnet)
+        if (subnet['ip_version'] == 6 and subnet['ipv6_ra_mode'] is None and
+                subnet['ipv6_address_mode'] is not None):
+            msg = (_('IPv6 subnet %s configured to receive RAs from an '
+                   'external router cannot be added to Neutron Router.') %
+                   subnet['id'])
+            raise n_exc.BadRequest(resource='router', msg=msg)
         self._check_for_dup_router_subnets(context, router,
                                            subnet['network_id'], [subnet])
         fixed_ip = {'ip_address': subnet['gateway_ip'],
@@ -1519,11 +1505,12 @@ class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
 
     @db_api.retry_if_session_inactive()
     def delete_disassociated_floatingips(self, context, network_id):
-        fip_ids = l3_obj.FloatingIP.get_disassociated_ids_for_net(
-            context, network_id)
+        fip_objs = l3_obj.FloatingIP.get_objects(
+            context,
+            floating_network_id=network_id, router_id=None, fixed_port_id=None)
 
-        for fip_id in fip_ids:
-            self.delete_floatingip(context, fip_id)
+        for fip in fip_objs:
+            self.delete_floatingip(context, fip.id)
 
     @db_api.retry_if_session_inactive()
     def get_floatingips_count(self, context, filters=None):

@@ -454,7 +454,7 @@ class TestLinuxBridgeManager(base.BaseTestCase):
                         return_value=vxlan_dev) as add_vxlan_fn,\
                     mock.patch.object(vxlan_dev.link, 'set_mtu',
                         side_effect=ip_lib.InvalidArgument(
-                            device='device_exists', namespace='ns')),\
+                            parameter="MTU", value=mtu)),\
                     mock.patch.object(ip_lib, 'get_device_mtu',
                         return_value=physical_mtu),\
                     mock.patch.object(vxlan_dev.link, 'delete') as delete_dev:
@@ -471,8 +471,7 @@ class TestLinuxBridgeManager(base.BaseTestCase):
                 dv6_fn.assert_not_called()
 
     def test__update_interface_ip_details(self):
-        gwdict = dict(cidr='1.1.1.1/24',
-                      via='1.1.1.1',
+        gwdict = dict(via='1.1.1.1',
                       metric=50)
         ipdict = dict(cidr='1.1.1.1/24',
                       broadcast='1.1.1.255',

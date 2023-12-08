@@ -20,7 +20,6 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants
 from neutron_lib import context
-from neutron_lib.objects import exceptions as obj_exc
 import sqlalchemy
 import testtools
 
@@ -77,10 +76,6 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
         self.mock_quota_make_res = make_res.start()
         commit_res = mock.patch.object(quota.QuotaEngine, 'commit_reservation')
         self.mock_quota_commit_res = commit_res.start()
-        is_ext_supported = mock.patch(
-            'neutron_lib.api.extensions.is_extension_supported')
-        self.is_ext_supported = is_ext_supported.start()
-        self.is_ext_supported.return_value = True
 
     def test_create_security_group_conflict(self):
         with mock.patch.object(registry, "publish") as mock_publish:
@@ -359,8 +354,7 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
                  mock.call('security_group', 'after_delete',
                            mock.ANY, context=mock.ANY,
                            security_group_id=sg_dict['id'],
-                           security_group_rule_ids=[mock.ANY, mock.ANY],
-                           name=sg_dict['name'])])
+                           security_group_rule_ids=[mock.ANY, mock.ANY])])
 
     def test_security_group_rule_precommit_create_event_fail(self):
         registry.subscribe(fake_callback, resources.SECURITY_GROUP_RULE,
@@ -485,116 +479,3 @@ class SecurityGroupDbMixinTestCase(testlib_api.SqlTestCase):
             {'port_range_min': None,
              'port_range_max': 200,
              'protocol': constants.PROTO_NAME_VRRP})
-
-    def _create_environment(self):
-        self.sg = copy.deepcopy(FAKE_SECGROUP)
-        self.user_ctx = context.Context(user_id='user1', tenant_id='tenant_1',
-                                        is_admin=False, overwrite=False)
-        self.admin_ctx = context.Context(user_id='user2', tenant_id='tenant_2',
-                                         is_admin=True, overwrite=False)
-        self.sg_user = self.mixin.create_security_group(
-            self.user_ctx, {'security_group': {'name': 'name',
-                                               'tenant_id': 'tenant_1',
-                                               'description': 'fake'}})
-
-    def test_get_security_group_rules(self):
-        self._create_environment()
-        rules_before = self.mixin.get_security_group_rules(self.user_ctx)
-
-        rule = copy.deepcopy(FAKE_SECGROUP_RULE)
-        rule['security_group_rule']['security_group_id'] = self.sg_user['id']
-        rule['security_group_rule']['tenant_id'] = 'tenant_2'
-        self.mixin.create_security_group_rule(self.admin_ctx, rule)
-
-        rules_after = self.mixin.get_security_group_rules(self.user_ctx)
-        self.assertEqual(len(rules_before) + 1, len(rules_after))
-        for rule in (rule for rule in rules_after if rule not in rules_before):
-            self.assertEqual('tenant_2', rule['tenant_id'])
-
-    def test_get_security_group_rules_filters_passed(self):
-        self._create_environment()
-        filters = {'security_group_id': self.sg_user['id']}
-        rules_before = self.mixin.get_security_group_rules(self.user_ctx,
-                                                           filters=filters)
-
-        default_sg = self.mixin.get_security_groups(
-            self.user_ctx, filters={'name': 'default'})[0]
-        rule = copy.deepcopy(FAKE_SECGROUP_RULE)
-        rule['security_group_rule']['security_group_id'] = default_sg['id']
-        rule['security_group_rule']['tenant_id'] = 'tenant_1'
-        self.mixin.create_security_group_rule(self.user_ctx, rule)
-
-        rules_after = self.mixin.get_security_group_rules(self.user_ctx,
-                                                          filters=filters)
-        self.assertEqual(rules_before, rules_after)
-
-    def test_get_security_group_rules_admin_context(self):
-        self._create_environment()
-        rules_before = self.mixin.get_security_group_rules(self.ctx)
-
-        rule = copy.deepcopy(FAKE_SECGROUP_RULE)
-        rule['security_group_rule']['security_group_id'] = self.sg_user['id']
-        rule['security_group_rule']['tenant_id'] = 'tenant_1'
-        self.mixin.create_security_group_rule(self.user_ctx, rule)
-
-        rules_after = self.mixin.get_security_group_rules(self.ctx)
-        self.assertEqual(len(rules_before) + 1, len(rules_after))
-        for rule in (rule for rule in rules_after if rule not in rules_before):
-            self.assertEqual('tenant_1', rule['tenant_id'])
-            self.assertEqual(self.sg_user['id'], rule['security_group_id'])
-
-    def test__ensure_default_security_group(self):
-        with mock.patch.object(
-                self.mixin, '_get_default_sg_id') as get_default_sg_id,\
-                mock.patch.object(
-                        self.mixin, 'create_security_group') as create_sg:
-            get_default_sg_id.return_value = None
-            self.mixin._ensure_default_security_group(self.ctx, 'tenant_1')
-            create_sg.assert_called_once_with(
-                self.ctx,
-                {'security_group': {
-                    'name': 'default',
-                    'tenant_id': 'tenant_1',
-                    'description': securitygroups_db.DEFAULT_SG_DESCRIPTION}},
-                default_sg=True)
-            get_default_sg_id.assert_called_once_with(self.ctx, 'tenant_1')
-
-    def test__ensure_default_security_group_already_exists(self):
-        with mock.patch.object(
-                self.mixin, '_get_default_sg_id') as get_default_sg_id,\
-                mock.patch.object(
-                        self.mixin, 'create_security_group') as create_sg:
-            get_default_sg_id.return_value = 'default_sg_id'
-            self.mixin._ensure_default_security_group(self.ctx, 'tenant_1')
-            create_sg.assert_not_called()
-            get_default_sg_id.assert_called_once_with(self.ctx, 'tenant_1')
-
-    def test__ensure_default_security_group_created_in_parallel(self):
-        with mock.patch.object(
-                self.mixin, '_get_default_sg_id') as get_default_sg_id,\
-                mock.patch.object(
-                        self.mixin, 'create_security_group') as create_sg:
-            get_default_sg_id.side_effect = [None, 'default_sg_id']
-            create_sg.side_effect = obj_exc.NeutronDbObjectDuplicateEntry(
-                mock.Mock(), mock.Mock())
-            self.mixin._ensure_default_security_group(self.ctx, 'tenant_1')
-            create_sg.assert_called_once_with(
-                self.ctx,
-                {'security_group': {
-                    'name': 'default',
-                    'tenant_id': 'tenant_1',
-                    'description': securitygroups_db.DEFAULT_SG_DESCRIPTION}},
-                default_sg=True)
-            get_default_sg_id.assert_has_calls([
-                mock.call(self.ctx, 'tenant_1'),
-                mock.call(self.ctx, 'tenant_1')])
-
-    def test__ensure_default_security_group_when_disabled(self):
-        with mock.patch.object(
-                    self.mixin, '_get_default_sg_id') as get_default_sg_id,\
-                mock.patch.object(
-                        self.mixin, 'create_security_group') as create_sg:
-            self.is_ext_supported.return_value = False
-            self.mixin._ensure_default_security_group(self.ctx, 'tenant_1')
-            create_sg.assert_not_called()
-            get_default_sg_id.assert_not_called()

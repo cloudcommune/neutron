@@ -16,8 +16,8 @@
 from neutron_lib import constants as p_const
 
 
-# Special vlan_tci value indicating flat network
-FLAT_VLAN_TCI = '0x0000/0x1fff'
+# Special vlan_id value in ovs_vlan_allocations table indicating flat network
+FLAT_VLAN_ID = -1
 
 # Topic for tunnel notifications between the plugin and agent
 TUNNEL = 'tunnel'
@@ -41,14 +41,11 @@ TUNNEL_NETWORK_TYPES = [p_const.TYPE_GRE, p_const.TYPE_VXLAN,
 
 LOCAL_SWITCHING = 0
 
-# The pyhsical network types of support DVR router
-DVR_PHYSICAL_NETWORK_TYPES = [p_const.TYPE_VLAN, p_const.TYPE_FLAT]
-
 # Various tables for DVR use of integration bridge flows
 DVR_TO_SRC_MAC = 1
-DVR_TO_SRC_MAC_PHYSICAL = 2
+DVR_TO_SRC_MAC_VLAN = 2
 ARP_DVR_MAC_TO_DST_MAC = 3
-ARP_DVR_MAC_TO_DST_MAC_PHYSICAL = 4
+ARP_DVR_MAC_TO_DST_MAC_VLAN = 4
 CANARY_TABLE = 23
 
 # Table for ARP poison/spoofing prevention rules
@@ -59,8 +56,7 @@ MAC_SPOOF_TABLE = 25
 
 # Table to decide whether further filtering is needed
 TRANSIENT_TABLE = 60
-LOCAL_MAC_DIRECT = 61
-TRANSIENT_EGRESS_TABLE = 62
+TRANSIENT_EGRESS_TABLE = 61
 
 # Tables used for ovs firewall
 BASE_EGRESS_TABLE = 71
@@ -86,11 +82,10 @@ ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE = 94
 INT_BR_ALL_TABLES = (
     LOCAL_SWITCHING,
     DVR_TO_SRC_MAC,
-    DVR_TO_SRC_MAC_PHYSICAL,
+    DVR_TO_SRC_MAC_VLAN,
     CANARY_TABLE,
     ARP_SPOOF_TABLE,
     MAC_SPOOF_TABLE,
-    LOCAL_MAC_DIRECT,
     TRANSIENT_TABLE,
     TRANSIENT_EGRESS_TABLE,
     BASE_EGRESS_TABLE,
@@ -133,15 +128,15 @@ TUN_BR_ALL_TABLES = (
 # --- Physical Bridges (phys_brs)
 
 # Various tables for DVR use of physical bridge flows
-DVR_PROCESS_PHYSICAL = 1
+DVR_PROCESS_VLAN = 1
 LOCAL_VLAN_TRANSLATION = 2
-DVR_NOT_LEARN_PHYSICAL = 3
+DVR_NOT_LEARN_VLAN = 3
 
 PHY_BR_ALL_TABLES = (
     LOCAL_SWITCHING,
-    DVR_PROCESS_PHYSICAL,
+    DVR_PROCESS_VLAN,
     LOCAL_VLAN_TRANSLATION,
-    DVR_NOT_LEARN_PHYSICAL)
+    DVR_NOT_LEARN_VLAN)
 
 # --- end of OpenFlow table IDs
 

@@ -20,7 +20,6 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants as n_const
 from neutron_lib.db import api as db_api
-from neutron_lib import exceptions as nlib_exc
 from neutron_lib.plugins import directory
 from oslo_db import exception as db_exc
 from oslo_log import log
@@ -35,7 +34,6 @@ from neutron.db import models_v2
 from neutron.objects import base as objects_base
 from neutron.objects import ports as port_obj
 from neutron.plugins.ml2 import models
-from neutron.services.segments import db as seg_db
 from neutron.services.segments import exceptions as seg_exc
 
 LOG = log.getLogger(__name__)
@@ -338,32 +336,21 @@ def is_dhcp_active_on_any_subnet(context, subnet_ids):
 def _prevent_segment_delete_with_port_bound(resource, event, trigger,
                                             payload=None):
     """Raise exception if there are any ports bound with segment_id."""
-    if payload.metadata.get(seg_db.FOR_NET_DELETE):
+    if payload.metadata.get('for_net_delete'):
         # don't check for network deletes
         return
 
     with db_api.CONTEXT_READER.using(payload.context):
-        auto_delete_port_ids, proper_port_count = port_obj.Port.\
-            get_auto_deletable_port_ids_and_proper_port_count_by_segment(
-                payload.context, segment_id=payload.resource_id)
+        port_ids = port_obj.Port.get_port_ids_filter_by_segment_id(
+            payload.context, segment_id=payload.resource_id)
 
-    if proper_port_count:
-        reason = (_("The segment is still bound with %s port(s)") %
-                  (proper_port_count + len(auto_delete_port_ids)))
+    # There are still some ports in the segment, segment should not be deleted
+    # TODO(xiaohhui): Should we delete the dhcp port automatically here?
+    if port_ids:
+        reason = _("The segment is still bound with port(s) "
+                   "%s") % ", ".join(port_ids)
         raise seg_exc.SegmentInUse(segment_id=payload.resource_id,
                                    reason=reason)
-
-    if auto_delete_port_ids:
-        LOG.debug("Auto-deleting dhcp port(s) on segment %s: %s",
-            payload.resource_id, ", ".join(auto_delete_port_ids))
-        plugin = directory.get_plugin()
-    for port_id in auto_delete_port_ids:
-        try:
-            plugin.delete_port(payload.context.elevated(), port_id)
-        except nlib_exc.PortNotFound:
-            # Don't raise if something else concurrently deleted the port
-            LOG.debug("Ignoring PortNotFound when deleting port '%s'. "
-                      "The port has already been deleted.", port_id)
 
 
 def subscribe():

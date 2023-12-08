@@ -111,7 +111,7 @@ def assert_ping(src_namespace, dst_ip, timeout=1, count=3):
     ipversion = netaddr.IPAddress(dst_ip).version
     ping_command = 'ping' if ipversion == 4 else 'ping6'
     ns_ip_wrapper = ip_lib.IPWrapper(src_namespace)
-    ns_ip_wrapper.netns.execute([ping_command, '-W', timeout, '-c', count,
+    ns_ip_wrapper.netns.execute([ping_command, '-c', count, '-W', timeout,
                                  dst_ip])
 
 
@@ -124,7 +124,7 @@ def assert_async_ping(src_namespace, dst_ip, timeout=1, count=1, interval=1):
     # cannot be used and it needs to be done using the following workaround.
     for _index in range(count):
         start_time = time.time()
-        ns_ip_wrapper.netns.execute([ping_command, '-W', timeout, '-c', '1',
+        ns_ip_wrapper.netns.execute([ping_command, '-c', '1', '-W', timeout,
                                      dst_ip])
         end_time = time.time()
         diff = end_time - start_time
@@ -327,25 +327,11 @@ class RootHelperProcess(subprocess.Popen):
             if utils.pid_invoked_with_cmdline(child_pid, self.cmd):
                 return True
 
-        try:
-            common_utils.wait_until_true(child_is_running, timeout)
-        except common_utils.WaitTimeout:
-            # If there is an error, the stderr and stdout pipes usually have
-            # information returned by the command executed. If not, timeout
-            # the pipe communication quickly.
-            stdout = stderr = ''
-            try:
-                stdout, stderr = self.communicate(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                pass
-            msg = ("Process %(cmd)s hasn't been spawned in %(seconds)d "
-                   "seconds. Return code: %(ret_code)s, stdout: %(stdout)s, "
-                   "stderr: %(stderr)s" %
-                   {'cmd': self.cmd, 'seconds': timeout,
-                    'ret_code': self.returncode, 'stdout': stdout,
-                    'stderr': stderr})
-            raise RuntimeError(msg)
-
+        common_utils.wait_until_true(
+            child_is_running,
+            timeout,
+            exception=RuntimeError("Process %s hasn't been spawned "
+                                   "in %d seconds" % (self.cmd, timeout)))
         self.child_pid = utils.get_root_helper_child_pid(
             self.pid, self.cmd, run_as_root=True)
 
@@ -416,12 +402,11 @@ class Pinger(object):
             raise RuntimeError("This pinger has already a running process")
         ip_version = common_utils.get_ip_version(self.address)
         ping_exec = 'ping' if ip_version == n_const.IP_VERSION_4 else 'ping6'
-        cmd = [ping_exec, '-W', str(self.timeout)]
+        cmd = [ping_exec, self.address, '-W', str(self.timeout)]
         if self.count:
             cmd.extend(['-c', str(self.count)])
         if self.interval:
             cmd.extend(['-i', str(self.interval)])
-        cmd.append(self.address)
         self.proc = RootHelperProcess(cmd, namespace=self.namespace)
 
     def stop(self):

@@ -12,7 +12,6 @@
 arping: CommandFilter, arping, root
 
 # l3_agent
-ethtool: CommandFilter, ethtool, root
 sysctl: CommandFilter, sysctl, root
 route: CommandFilter, route, root
 radvd: CommandFilter, radvd, root
@@ -25,7 +24,6 @@ kill_haproxy_script: CommandFilter, haproxy-kill, root
 
 kill_radvd_usr: KillFilter, root, /usr/sbin/radvd, -15, -9, -HUP
 kill_radvd: KillFilter, root, /sbin/radvd, -15, -9, -HUP
-kill_radvd_script: CommandFilter, radvd-kill, root
 
 # ip_lib
 ip: IpFilter, ip, root

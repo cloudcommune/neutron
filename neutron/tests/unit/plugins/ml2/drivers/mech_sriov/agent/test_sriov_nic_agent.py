@@ -19,13 +19,12 @@ from neutron_lib.api.definitions import portbindings
 from neutron_lib import constants
 from oslo_config import cfg
 from oslo_utils import uuidutils
-import pyroute2
 
 from neutron.agent.l2 import l2_agent_extensions_manager as l2_ext_manager
 from neutron.agent import rpc as agent_rpc
 from neutron.plugins.ml2.drivers.mech_sriov.agent.common import config  # noqa
+from neutron.plugins.ml2.drivers.mech_sriov.agent.common import exceptions
 from neutron.plugins.ml2.drivers.mech_sriov.agent import sriov_nic_agent
-from neutron.privileged.agent.linux import ip_lib as priv_ip_lib
 from neutron.tests import base
 
 DEVICE_MAC = '11:22:33:44:55:66'
@@ -76,6 +75,12 @@ class TestSriovAgent(base.BaseTestCase):
         self.agent.scan_devices(set(), set())
         self.assertEqual(2, agent_conf['devices'])
 
+    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent.pci_lib."
+                "PciDeviceIPWrapper.get_assigned_macs",
+                return_value=[(DEVICE_MAC, PCI_SLOT)])
+    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent."
+                "eswitch_manager.PciOsWrapper.is_assigned_vf",
+                return_value=True)
     def test_treat_devices_removed_with_existed_device(self, *args):
         agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
         devices = [(DEVICE_MAC, PCI_SLOT)]
@@ -87,6 +92,12 @@ class TestSriovAgent(base.BaseTestCase):
             self.assertFalse(resync)
             self.assertTrue(fn_udd.called)
 
+    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent.pci_lib."
+                "PciDeviceIPWrapper.get_assigned_macs",
+                return_value=[(DEVICE_MAC, PCI_SLOT)])
+    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent."
+                "eswitch_manager.PciOsWrapper.is_assigned_vf",
+                return_value=True)
     def test_treat_devices_removed_with_not_existed_device(self, *args):
         agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
         devices = [(DEVICE_MAC, PCI_SLOT)]
@@ -101,6 +112,12 @@ class TestSriovAgent(base.BaseTestCase):
                 self.assertFalse(resync)
                 self.assertTrue(fn_udd.called)
 
+    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent.pci_lib."
+                "PciDeviceIPWrapper.get_assigned_macs",
+                return_value=[(DEVICE_MAC, PCI_SLOT)])
+    @mock.patch("neutron.plugins.ml2.drivers.mech_sriov.agent."
+                "eswitch_manager.PciOsWrapper.is_assigned_vf",
+                return_value=True)
     def test_treat_devices_removed_failed(self, *args):
         agent = sriov_nic_agent.SriovNicSwitchAgent({}, {}, 0, {}, {}, {})
         devices = [(DEVICE_MAC, PCI_SLOT)]
@@ -424,7 +441,8 @@ class TestSriovAgent(base.BaseTestCase):
         agent.eswitch_mgr = mock.Mock()
         agent.eswitch_mgr.device_exists.return_value = True
         agent.eswitch_mgr.set_device_state.side_effect = (
-            priv_ip_lib.InterfaceOperationNotSupported())
+            exceptions.IpCommandOperationNotSupportedError(
+                dev_name='aa:bb:cc:dd:ee:ff'))
 
         self.assertTrue(agent.treat_device('aa:bb:cc:dd:ee:ff', '1:2:3:0',
                                            admin_state_up=True))
@@ -435,7 +453,7 @@ class TestSriovAgent(base.BaseTestCase):
         agent.eswitch_mgr = mock.Mock()
         agent.eswitch_mgr.device_exists.return_value = True
         agent.eswitch_mgr.set_device_state.side_effect = (
-            pyroute2.NetlinkError(22))
+            exceptions.SriovNicError())
 
         self.assertFalse(agent.treat_device('aa:bb:cc:dd:ee:ff', '1:2:3:0',
                                            admin_state_up=True))

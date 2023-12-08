@@ -15,7 +15,6 @@
 
 import errno
 import re
-import threading
 import time
 
 import eventlet
@@ -28,6 +27,7 @@ from pyroute2.netlink import exceptions as netlink_exceptions
 from pyroute2.netlink import rtnl
 from pyroute2.netlink.rtnl import ifaddrmsg
 from pyroute2.netlink.rtnl import ifinfmsg
+from pyroute2 import NetlinkError
 from pyroute2 import netns
 
 from neutron._i18n import _
@@ -75,13 +75,6 @@ DEFAULT_GW_PATTERN = re.compile(r"via (\S+)")
 METRIC_PATTERN = re.compile(r"metric (\S+)")
 DEVICE_NAME_PATTERN = re.compile(r"(\d+?): (\S+?):.*")
 
-# NOTE: no metric is interpreted by the kernel as having the highest priority
-# (value 0). "ip route" uses the netlink API to communicate with the kernel. In
-# IPv6, when the metric value is not set is translated as 1024 as default:
-# https://access.redhat.com/solutions/3659171
-IP_ROUTE_METRIC_DEFAULT = {constants.IP_VERSION_4: 0,
-                           constants.IP_VERSION_6: 1024}
-
 
 def remove_interface_suffix(interface):
     """Remove a possible "<if>@<endpoint>" suffix from an interface' name.
@@ -99,7 +92,9 @@ class AddressNotReady(exceptions.NeutronException):
                 "become ready: %(reason)s")
 
 
-InvalidArgument = privileged.InvalidArgument
+class InvalidArgument(exceptions.NeutronException):
+    message = _("Invalid value %(value)s for parameter %(parameter)s "
+                "provided.")
 
 
 class SubProcessBase(object):
@@ -439,8 +434,13 @@ class IpLinkCommand(IpDeviceCommandBase):
             self.name, self._parent.namespace, ifinfmsg.IFF_ALLMULTI)
 
     def set_mtu(self, mtu_size):
-        privileged.set_link_attribute(
-            self.name, self._parent.namespace, mtu=mtu_size)
+        try:
+            privileged.set_link_attribute(
+                self.name, self._parent.namespace, mtu=mtu_size)
+        except NetlinkError as e:
+            if e.code == errno.EINVAL:
+                raise InvalidArgument(parameter="MTU", value=mtu_size)
+            raise
 
     def set_up(self):
         privileged.set_link_attribute(
@@ -508,17 +508,6 @@ class IpLinkCommand(IpDeviceCommandBase):
         return privileged.get_link_attributes(self.name,
                                               self._parent.namespace)
 
-    @property
-    def exists(self):
-        return privileged.interface_exists(self.name, self._parent.namespace)
-
-    def get_vfs(self):
-        return privileged.get_link_vfs(self.name, self._parent.namespace)
-
-    def set_vf_feature(self, vf_config):
-        return privileged.set_link_vf_feature(
-            self.name, self._parent.namespace, vf_config)
-
 
 class IpAddrCommand(IpDeviceCommandBase):
     COMMAND = 'addr'
@@ -551,7 +540,7 @@ class IpAddrCommand(IpDeviceCommandBase):
             if not common_utils.is_cidr_host(cidr):
                 kwargs['mask'] = common_utils.cidr_mask_length(cidr)
         if scope:
-            kwargs['scope'] = scope
+            kwargs['scope'] = IP_ADDRESS_SCOPE_NAME[scope]
         if ip_version:
             kwargs['family'] = common_utils.get_socket_address_family(
                 ip_version)
@@ -956,8 +945,8 @@ def ensure_device_is_ready(device_name, namespace=None):
     dev = IPDevice(device_name, namespace=namespace)
     try:
         # Ensure the device has a MAC address and is up, even if it is already
-        # up.
-        if not dev.link.exists or not dev.link.address:
+        # up. If the device doesn't exist, a RuntimeError will be raised.
+        if not dev.link.address:
             LOG.error("Device %s cannot be used as it has no MAC "
                       "address", device_name)
             return False
@@ -1043,8 +1032,7 @@ def _arping(ns_name, iface_name, address, count, log_exception):
 
 
 def send_ip_addr_adv_notif(
-        ns_name, iface_name, address, count=3, log_exception=True,
-        use_eventlet=True):
+        ns_name, iface_name, address, count=3, log_exception=True):
     """Send advance notification of an IP address assignment.
 
     If the address is in the IPv4 family, send gratuitous ARP.
@@ -1062,18 +1050,12 @@ def send_ip_addr_adv_notif(
     :param log_exception: (Optional) True if possible failures should be logged
                           on exception level. Otherwise they are logged on
                           WARNING level. Default is True.
-    :param use_eventlet: (Optional) True if the arping command will be spawned
-                         using eventlet, False to use Python threads
-                         (threading).
     """
     def arping():
         _arping(ns_name, iface_name, address, count, log_exception)
 
     if count > 0 and netaddr.IPAddress(address).version == 4:
-        if use_eventlet:
-            eventlet.spawn_n(arping)
-        else:
-            threading.Thread(target=arping).start()
+        eventlet.spawn_n(arping)
 
 
 def sysctl(cmd, namespace=None, log_fail_as_error=True):
@@ -1340,37 +1322,32 @@ def _parse_ip_address(pyroute2_address, device_name):
             'event': event}
 
 
-def get_devices_with_ip(namespace, name=None, **kwargs):
+def _parse_link_device(namespace, device, **kwargs):
+    """Parse pytoute2 link device information
+
+    For each link device, the IP address information is retrieved and returned
+    in a dictionary.
+    IP address scope: http://linux-ip.net/html/tools-ip-address.html
+    """
     retval = []
+    name = get_attr(device, 'IFLA_IFNAME')
+    ip_addresses = privileged.get_ip_addresses(namespace,
+                                               index=device['index'],
+                                               **kwargs)
+    for ip_address in ip_addresses:
+        retval.append(_parse_ip_address(ip_address, name))
+    return retval
+
+
+def get_devices_with_ip(namespace, name=None, **kwargs):
     link_args = {}
     if name:
         link_args['ifname'] = name
-    scope = kwargs.pop('scope', None)
-    if scope:
-        kwargs['scope'] = IP_ADDRESS_SCOPE_NAME[scope]
-
-    if not link_args:
-        ip_addresses = privileged.get_ip_addresses(namespace, **kwargs)
-    else:
-        device = get_devices_info(namespace, **link_args)
-        if not device:
-            return retval
-        ip_addresses = privileged.get_ip_addresses(
-            namespace, index=device[0]['index'], **kwargs)
-
-    devices = {}  # {device index: name}
-    for ip_address in ip_addresses:
-        index = ip_address['index']
-        name = get_attr(ip_address, 'IFA_LABEL') or devices.get(index)
-        if not name:
-            device = get_devices_info(namespace, index=index)
-            if not device:
-                continue
-            name = device[0]['name']
-
-        retval.append(_parse_ip_address(ip_address, name))
-        devices[index] = name
-
+    devices = privileged.get_link_devices(namespace, **link_args)
+    retval = []
+    for parsed_ips in (_parse_link_device(namespace, device, **kwargs)
+                       for device in devices):
+        retval += parsed_ips
     return retval
 
 
@@ -1435,7 +1412,7 @@ def ip_monitor(namespace, queue, event_stop, event_started):
                 return
             raise
 
-    def read_ip_updates(_ip, _queue):
+    def read_ip_updates(_queue):
         """Read Pyroute2.IPRoute input socket
 
         The aim of this function is to open and bind an IPRoute socket only for
@@ -1443,14 +1420,13 @@ def ip_monitor(namespace, queue, event_stop, event_started):
         opened socket. This function is executed in a separate thread,
         dedicated only to this task.
         """
-        _ip.bind(async_cache=True)
-        try:
+        with privileged.get_iproute(namespace) as ip:
+            ip.bind()
             while True:
-                ip_addresses = _ip.get()
+                eventlet.sleep(0)
+                ip_addresses = ip.get()
                 for ip_address in ip_addresses:
                     _queue.put(ip_address)
-        except EOFError:
-            pass
 
     _queue = eventlet.Queue()
     try:
@@ -1459,14 +1435,13 @@ def ip_monitor(namespace, queue, event_stop, event_started):
             for device in ip.get_links():
                 cache_devices[device['index']] = get_attr(device,
                                                           'IFLA_IFNAME')
-        _ip = privileged.get_iproute(namespace)
-        ip_updates_thread = threading.Thread(target=read_ip_updates,
-                                             args=(_ip, _queue))
-        ip_updates_thread.start()
-        event_started.set()
-        while not event_stop.is_set():
+        pool = eventlet.GreenPool(1)
+        ip_updates_thread = pool.spawn(read_ip_updates, _queue)
+        event_started.send()
+        while not event_stop.ready():
+            eventlet.sleep(0)
             try:
-                ip_address = _queue.get(timeout=1)
+                ip_address = _queue.get(timeout=2)
             except eventlet.queue.Empty:
                 continue
             if 'index' in ip_address and 'prefixlen' in ip_address:
@@ -1479,8 +1454,7 @@ def ip_monitor(namespace, queue, event_stop, event_started):
                 cache_devices[index] = name
                 queue.put(_parse_ip_address(ip_address, name))
 
-        _ip.close()
-        ip_updates_thread.join(timeout=5)
+        ip_updates_thread.kill()
 
     except OSError as e:
         if e.errno == errno.ENOENT:
@@ -1519,8 +1493,6 @@ def list_ip_routes(namespace, ip_version, scope=None, via=None, table=None,
         else:
             cidr = constants.IP_ANY[ip_version]
         table = int(get_attr(route, 'RTA_TABLE'))
-        metric = (get_attr(route, 'RTA_PRIORITY') or
-                  IP_ROUTE_METRIC_DEFAULT[ip_version])
         value = {
             'table': IP_RULE_TABLES_NAMES.get(table, table),
             'source_prefix': get_attr(route, 'RTA_PREFSRC'),
@@ -1528,7 +1500,7 @@ def list_ip_routes(namespace, ip_version, scope=None, via=None, table=None,
             'scope': IP_ADDRESS_SCOPE[int(route['scope'])],
             'device': get_device(int(get_attr(route, 'RTA_OIF')), devices),
             'via': get_attr(route, 'RTA_GATEWAY'),
-            'metric': metric,
+            'metric': get_attr(route, 'RTA_PRIORITY'),
         }
 
         ret.append(value)

@@ -154,9 +154,7 @@ class TestDvrRouterOperations(base.BaseTestCase):
         kwargs['router'] = router
         kwargs['agent_conf'] = self.conf
         kwargs['interface_driver'] = mock.Mock()
-        with mock.patch.object(dvr_router.DvrLocalRouter,
-                               'load_used_fip_information'):
-            return dvr_router.DvrLocalRouter(HOSTNAME, **kwargs)
+        return dvr_router.DvrLocalRouter(HOSTNAME, **kwargs)
 
     def _set_ri_kwargs(self, agent, router_id, router):
         self.ri_kwargs['agent'] = agent
@@ -223,33 +221,6 @@ class TestDvrRouterOperations(base.BaseTestCase):
                 ri._add_interface_route_to_fip_ns.called)
             self.assertTrue(
                 ri.fip_ns.create_rtr_2_fip_link.called)
-
-    def test_load_used_fip_information(self):
-        router = mock.MagicMock()
-        with mock.patch.object(dvr_router.DvrLocalRouter,
-                               'get_floating_ips') as mock_get_floating_ips:
-            with mock.patch.object(dvr_router.DvrLocalRouter,
-                                   'get_ex_gw_port') as mock_ext_port:
-                mock_ext_port.return_value = {'network_id': _uuid()}
-                fip = {'id': _uuid(),
-                       'host': HOSTNAME,
-                       'floating_ip_address': '15.1.2.3',
-                       'fixed_ip_address': '192.168.0.1',
-                       'floating_network_id': _uuid(),
-                       'port_id': _uuid()}
-                fip_ns = mock.MagicMock()
-                fip_ns.lookup_rule_priority.return_value = 1234
-                mock_get_floating_ips.return_value = [fip]
-                mock_agent = mock.MagicMock()
-                mock_agent.get_fip_ns.return_value = fip_ns
-                kwargs = {'agent': mock_agent,
-                          'router_id': _uuid(),
-                          'router': mock.Mock(),
-                          'agent_conf': self.conf,
-                          'interface_driver': mock.Mock()}
-                router = dvr_router.DvrLocalRouter(HOSTNAME, **kwargs)
-                self.assertEqual({'15.1.2.3': ('192.168.0.1', 1234)},
-                                 router.floating_ips_dict)
 
     def test_get_floating_ips_dvr(self):
         router = mock.MagicMock()
@@ -860,7 +831,7 @@ class TestDvrRouterOperations(base.BaseTestCase):
         fip = {'id': _uuid()}
         fip_cidr = '11.22.33.44/24'
 
-        ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, **self.ri_kwargs)
+        ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, [], **self.ri_kwargs)
         ri.is_router_master = mock.Mock(return_value=False)
         ri._add_vip = mock.Mock()
         interface_name = ri.get_snat_external_device_interface_name(
@@ -871,7 +842,7 @@ class TestDvrRouterOperations(base.BaseTestCase):
 
         router[lib_constants.HA_INTERFACE_KEY]['status'] = 'DOWN'
         self._set_ri_kwargs(agent, router['id'], router)
-        ri_1 = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, **self.ri_kwargs)
+        ri_1 = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, [], **self.ri_kwargs)
         ri_1.is_router_master = mock.Mock(return_value=True)
         ri_1._add_vip = mock.Mock()
         interface_name = ri_1.get_snat_external_device_interface_name(
@@ -882,7 +853,7 @@ class TestDvrRouterOperations(base.BaseTestCase):
 
         router[lib_constants.HA_INTERFACE_KEY]['status'] = 'ACTIVE'
         self._set_ri_kwargs(agent, router['id'], router)
-        ri_2 = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, **self.ri_kwargs)
+        ri_2 = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, [], **self.ri_kwargs)
         ri_2.is_router_master = mock.Mock(return_value=True)
         ri_2._add_vip = mock.Mock()
         interface_name = ri_2.get_snat_external_device_interface_name(
@@ -904,59 +875,16 @@ class TestDvrRouterOperations(base.BaseTestCase):
         self._set_ri_kwargs(agent, router['id'], router)
         fip_cidr = '11.22.33.44/24'
 
-        ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, **self.ri_kwargs)
+        ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, [], **self.ri_kwargs)
         ri.is_router_master = mock.Mock(return_value=False)
         ri._remove_vip = mock.Mock()
         ri.remove_centralized_floatingip(fip_cidr)
         ri._remove_vip.assert_called_once_with(fip_cidr)
         super_remove_centralized_floatingip.assert_not_called()
 
-        ri1 = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, **self.ri_kwargs)
+        ri1 = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, [], **self.ri_kwargs)
         ri1.is_router_master = mock.Mock(return_value=True)
         ri1._remove_vip = mock.Mock()
         ri1.remove_centralized_floatingip(fip_cidr)
         ri1._remove_vip.assert_called_once_with(fip_cidr)
         super_remove_centralized_floatingip.assert_called_once_with(fip_cidr)
-
-    def test_initialize_dvr_ha_router_snat_ns_once(self):
-        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
-        agent.conf.agent_mode = lib_constants.L3_AGENT_MODE_DVR_SNAT
-        router = l3_test_common.prepare_router_data(
-            num_internal_ports=2, enable_ha=True)
-        router['gw_port_host'] = HOSTNAME
-        router[lib_constants.HA_INTERFACE_KEY]['status'] = 'ACTIVE'
-        self.mock_driver.unplug.reset_mock()
-        self._set_ri_kwargs(agent, router['id'], router)
-        ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, **self.ri_kwargs)
-        ri._ha_state_path = self.get_temp_file_path('router_ha_state')
-        ri._create_snat_namespace = mock.Mock()
-        ri._plug_external_gateway = mock.Mock()
-        ri.initialize(mock.Mock())
-        ri._create_dvr_gateway(mock.Mock(), mock.Mock())
-        ri._create_snat_namespace.assert_called_once_with()
-
-    def test_initialize_dvr_ha_router_reset_state(self):
-        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
-        agent.conf.agent_mode = lib_constants.L3_AGENT_MODE_DVR_SNAT
-        router = l3_test_common.prepare_router_data(
-            num_internal_ports=2, enable_ha=True)
-        router['gw_port_host'] = HOSTNAME
-        router[lib_constants.HA_INTERFACE_KEY]['status'] = 'ACTIVE'
-        self.mock_driver.unplug.reset_mock()
-        self._set_ri_kwargs(agent, router['id'], router)
-
-        ri = dvr_edge_ha_rtr.DvrEdgeHaRouter(HOSTNAME, **self.ri_kwargs)
-        ri._ha_state_path = self.get_temp_file_path('router_ha_state')
-
-        with open(ri._ha_state_path, "w") as f:
-            f.write("master")
-
-        ri._create_snat_namespace = mock.Mock()
-        ri._plug_external_gateway = mock.Mock()
-        with mock.patch("neutron.agent.linux.keepalived."
-                        "KeepalivedManager.check_processes",
-                        return_value=False):
-            ri.initialize(mock.Mock())
-            with open(ri._ha_state_path, "r") as f:
-                state = f.readline()
-                self.assertEqual("backup", state)

@@ -15,8 +15,6 @@
 
 import collections
 import copy
-import datetime
-import signal
 import sys
 import uuid
 
@@ -34,7 +32,6 @@ from neutron.agent.dhcp import agent as dhcp_agent
 from neutron.agent import dhcp_agent as entry
 from neutron.agent.linux import dhcp
 from neutron.agent.linux import interface
-from neutron.agent.linux import utils as linux_utils
 from neutron.agent.metadata import driver as metadata_driver
 from neutron.common import config as common_config
 from neutron.common import utils
@@ -458,20 +455,6 @@ class TestDhcpAgent(base.BaseTestCase):
             dhcp.start_ready_ports_loop()
             spawn.assert_called_once_with(dhcp._dhcp_ready_ports_loop)
 
-    def test__dhcp_ready_ports_doesnt_log_exception_on_timeout(self):
-        dhcp = dhcp_agent.DhcpAgent(HOSTNAME)
-        dhcp.dhcp_ready_ports = set(range(4))
-
-        with mock.patch.object(dhcp.plugin_rpc, 'dhcp_ready_on_ports',
-                               side_effect=oslo_messaging.MessagingTimeout):
-            # exit after 2 iterations
-            with mock.patch.object(dhcp_agent.eventlet, 'sleep',
-                                   side_effect=[0, 0, RuntimeError]):
-                with mock.patch.object(dhcp_agent.LOG, 'exception') as lex:
-                    with testtools.ExpectedException(RuntimeError):
-                        dhcp._dhcp_ready_ports_loop()
-        self.assertFalse(lex.called)
-
     def test__dhcp_ready_ports_loop(self):
         dhcp = dhcp_agent.DhcpAgent(HOSTNAME)
         dhcp.dhcp_ready_ports = set(range(4))
@@ -511,55 +494,6 @@ class TestDhcpAgent(base.BaseTestCase):
         ports_ready = (ready.call_args_list[0][0][0] |
                        ready.call_args_list[1][0][0])
         self.assertEqual(set(range(port_count)), ports_ready)
-
-    def test_dhcp_ready_ports_loop_with_limit_ports_per_call_prio(self):
-        dhcp = dhcp_agent.DhcpAgent(HOSTNAME)
-        sync_max = dhcp_agent.DHCP_READY_PORTS_SYNC_MAX
-        port_count = 4
-        # port set ranges must be unique to differentiate results
-        dhcp.dhcp_prio_ready_ports = set(range(sync_max))
-        dhcp.dhcp_ready_ports = set(range(sync_max, sync_max + port_count))
-
-        with mock.patch.object(dhcp.plugin_rpc,
-                               'dhcp_ready_on_ports') as ready:
-            # exit after 1 iteration
-            with mock.patch.object(dhcp_agent.eventlet, 'sleep',
-                                   side_effect=[0, RuntimeError]):
-                with testtools.ExpectedException(RuntimeError):
-                    dhcp._dhcp_ready_ports_loop()
-
-        # only priority ports should have been processed
-        self.assertEqual(set(), dhcp.dhcp_prio_ready_ports)
-        self.assertEqual(set(range(sync_max, sync_max + port_count)),
-                         dhcp.dhcp_ready_ports)
-        # one call is expected, with DHCP_READY_PORTS_SYNC_MAX ports
-        self.assertEqual(1, ready.call_count)
-        self.assertEqual(sync_max, len(ready.call_args_list[0][0][0]))
-        # priority ports need to be ready
-        ports_ready = ready.call_args_list[0][0][0]
-        self.assertEqual(set(range(sync_max)), ports_ready)
-
-        # add some priority ports, to make sure they are processed
-        dhcp.dhcp_prio_ready_ports = set(range(port_count))
-        with mock.patch.object(dhcp.plugin_rpc,
-                               'dhcp_ready_on_ports') as ready:
-            # exit after 1 iteration
-            with mock.patch.object(dhcp_agent.eventlet, 'sleep',
-                                   side_effect=[0, RuntimeError]):
-                with testtools.ExpectedException(RuntimeError):
-                    dhcp._dhcp_ready_ports_loop()
-
-        # all ports should have been processed
-        self.assertEqual(set(), dhcp.dhcp_prio_ready_ports)
-        self.assertEqual(set(), dhcp.dhcp_ready_ports)
-        # one call is expected, with (port_count * 2) ports
-        self.assertEqual(1, ready.call_count)
-        self.assertEqual(port_count * 2, len(ready.call_args_list[0][0][0]))
-        # all ports need to be ready
-        ports_ready = ready.call_args_list[0][0][0]
-        all_ports = (set(range(port_count)) |
-                     set(range(sync_max, sync_max + port_count)))
-        self.assertEqual(all_ports, ports_ready)
 
     def test_dhcp_ready_ports_updates_after_enable_dhcp(self):
         dhcp = dhcp_agent.DhcpAgent(HOSTNAME)
@@ -767,12 +701,6 @@ class TestDhcpAgentEventHandler(base.BaseTestCase):
         self.mock_resize_p = mock.patch('neutron.agent.dhcp.agent.'
                                         'DhcpAgent._resize_process_pool')
         self.mock_resize = self.mock_resize_p.start()
-        self.mock_wait_until_address_ready_p = mock.patch(
-            'neutron.agent.linux.ip_lib.'
-            'IpAddrCommand.wait_until_address_ready')
-        self.mock_wait_until_address_ready_p.start()
-        mock.patch.object(linux_utils, 'delete_if_exists').start()
-        self.addCleanup(self.mock_wait_until_address_ready_p.stop)
 
     def _process_manager_constructor_call(self, ns=FAKE_NETWORK_DHCP_NS):
         return mock.call(conf=cfg.CONF,
@@ -799,7 +727,7 @@ class TestDhcpAgentEventHandler(base.BaseTestCase):
         else:
             self.external_process.assert_has_calls([
                 self._process_manager_constructor_call(),
-                mock.call().disable(sig=str(int(signal.SIGTERM)))])
+                mock.call().disable()])
 
     def test_enable_dhcp_helper_enable_metadata_isolated_network(self):
         self._enable_dhcp_helper(isolated_network,
@@ -918,7 +846,7 @@ class TestDhcpAgentEventHandler(base.BaseTestCase):
         self.call_driver.assert_called_once_with('disable', fake_network)
         self.external_process.assert_has_calls([
             self._process_manager_constructor_call(),
-            mock.call().disable(sig=str(int(signal.SIGTERM)))])
+            mock.call().disable()])
 
     def test_disable_dhcp_helper_known_network_isolated_metadata(self):
         self._disable_dhcp_helper_known_network(isolated_metadata=True)
@@ -947,7 +875,7 @@ class TestDhcpAgentEventHandler(base.BaseTestCase):
             [mock.call.get_network_by_id(fake_network.id)])
         self.external_process.assert_has_calls([
             self._process_manager_constructor_call(),
-            mock.call().disable(sig=str(int(signal.SIGTERM)))
+            mock.call().disable()
         ])
 
     def test_disable_dhcp_helper_driver_failure_isolated_metadata(self):
@@ -1238,8 +1166,7 @@ class TestDhcpAgentEventHandler(base.BaseTestCase):
         self.dhcp.port_update_end(None, payload)
         self.dhcp._process_resource_update()
         self.reload_allocations.assert_called_once_with(fake_port2,
-                                                        fake_network,
-                                                        prio=True)
+                                                        fake_network)
 
     def test_reload_allocations(self):
         self.cache.get_port_by_id.return_value = fake_port2
@@ -1260,8 +1187,7 @@ class TestDhcpAgentEventHandler(base.BaseTestCase):
         self.dhcp.port_create_end(None, payload)
         self.dhcp._process_resource_update()
         self.reload_allocations.assert_called_once_with(fake_port2,
-                                                        fake_network,
-                                                        prio=True)
+                                                        fake_network)
 
     def test_port_create_end_no_resync_if_same_port_already_in_cache(self):
         self.reload_allocations_p = mock.patch.object(self.dhcp,
@@ -1275,8 +1201,7 @@ class TestDhcpAgentEventHandler(base.BaseTestCase):
         self.dhcp.port_create_end(None, payload)
         self.dhcp._process_resource_update()
         self.reload_allocations.assert_called_once_with(fake_port2,
-                                                        new_fake_network,
-                                                        prio=True)
+                                                        new_fake_network)
         self.schedule_resync.assert_not_called()
 
     def test_port_update_change_ip_on_port(self):
@@ -2347,63 +2272,3 @@ class TestDictModel(base.BaseTestCase):
         m = dhcp.DictModel(d)
         self.assertEqual(2, m.a[0].b)
         self.assertEqual(3, m.a[1].c)
-
-
-class TestDHCPResourceUpdate(base.BaseTestCase):
-
-    date1 = datetime.datetime(year=2021, month=2, day=1, hour=9, minute=1,
-                              second=2)
-    date2 = datetime.datetime(year=2021, month=2, day=1, hour=9, minute=1,
-                              second=1)  # older than date1
-
-    def test__lt__no_port_event(self):
-        # Lower numerical priority always gets precedence. DHCPResourceUpdate
-        # (and ResourceUpdate) objects with more precedence will return as
-        # "lower" in a "__lt__" method comparison.
-        update1 = dhcp_agent.DHCPResourceUpdate('id1', 5, obj_type='network')
-        update2 = dhcp_agent.DHCPResourceUpdate('id2', 6, obj_type='network')
-        self.assertLess(update1, update2)
-
-    def test__lt__no_port_event_timestamp(self):
-        update1 = dhcp_agent.DHCPResourceUpdate(
-            'id1', 5, timestamp=self.date1, obj_type='network')
-        update2 = dhcp_agent.DHCPResourceUpdate(
-            'id2', 6, timestamp=self.date2, obj_type='network')
-        self.assertLess(update1, update2)
-
-    def test__lt__port_no_fixed_ips(self):
-        update1 = dhcp_agent.DHCPResourceUpdate(
-            'id1', 5, timestamp=self.date1, resource={}, obj_type='port')
-        update2 = dhcp_agent.DHCPResourceUpdate(
-            'id2', 6, timestamp=self.date2, resource={}, obj_type='port')
-        self.assertLess(update1, update2)
-
-    def test__lt__port_fixed_ips_not_matching(self):
-        resource1 = {'fixed_ips': [
-            {'subnet_id': 'subnet1', 'ip_address': '10.0.0.1'}]}
-        resource2 = {'fixed_ips': [
-            {'subnet_id': 'subnet1', 'ip_address': '10.0.0.2'},
-            {'subnet_id': 'subnet2', 'ip_address': '10.0.1.1'}]}
-        update1 = dhcp_agent.DHCPResourceUpdate(
-            'id1', 5, timestamp=self.date1, resource=resource1,
-            obj_type='port')
-        update2 = dhcp_agent.DHCPResourceUpdate(
-            'id2', 6, timestamp=self.date2, resource=resource2,
-            obj_type='port')
-        self.assertLess(update1, update2)
-
-    def test__lt__port_fixed_ips_matching(self):
-        resource1 = {'fixed_ips': [
-            {'subnet_id': 'subnet1', 'ip_address': '10.0.0.1'}]}
-        resource2 = {'fixed_ips': [
-            {'subnet_id': 'subnet1', 'ip_address': '10.0.0.1'},
-            {'subnet_id': 'subnet2', 'ip_address': '10.0.0.2'}]}
-        update1 = dhcp_agent.DHCPResourceUpdate(
-            'id1', 5, timestamp=self.date1, resource=resource1,
-            obj_type='port')
-        update2 = dhcp_agent.DHCPResourceUpdate(
-            'id2', 6, timestamp=self.date2, resource=resource2,
-            obj_type='port')
-        # In this case, both "port" events have matching IPs. "__lt__" method
-        # uses the timestamp: date2 < date1
-        self.assertLess(update2, update1)

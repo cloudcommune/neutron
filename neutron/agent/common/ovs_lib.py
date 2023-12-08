@@ -71,9 +71,6 @@ _SENTINEL = object()
 CTRL_RATE_LIMIT_MIN = 100
 CTRL_BURST_LIMIT_MIN = 25
 
-# TODO(slaweq): move this to neutron_lib.constants
-TYPE_GRE_IP6 = 'ip6gre'
-
 
 def _ovsdb_result_pending(result):
     """Return True if ovsdb indicates the result is still pending."""
@@ -98,13 +95,6 @@ def _ovsdb_retry(fn):
                 self.ovsdb_timeout))(fn)
         return new_fn(*args, **kwargs)
     return wrapped
-
-
-def get_gre_tunnel_port_type(remote_ip, local_ip):
-    if (common_utils.get_ip_version(remote_ip) == p_const.IP_VERSION_6 or
-            common_utils.get_ip_version(local_ip) == p_const.IP_VERSION_6):
-        return TYPE_GRE_IP6
-    return p_const.TYPE_GRE
 
 
 class VifPort(object):
@@ -245,12 +235,6 @@ class OVSBridge(BaseOVS):
         self._default_cookie = generate_random_cookie()
         self._highest_protocol_needed = constants.OPENFLOW10
         self._min_bw_qos_id = uuidutils.generate_uuid()
-        # TODO(jlibosva): Revert initial_protocols once launchpad bug 1852221
-        #                 is fixed and new openvswitch containing the fix is
-        #                 released.
-        self.initial_protocols = {
-            constants.OPENFLOW10, constants.OPENFLOW13, constants.OPENFLOW14}
-        self.initial_protocols.add(self._highest_protocol_needed)
 
     @property
     def default_cookie(self):
@@ -289,29 +273,6 @@ class OVSBridge(BaseOVS):
         self._highest_protocol_needed = max(self._highest_protocol_needed,
                                             protocol,
                                             key=version_from_protocol)
-        self.initial_protocols.add(self._highest_protocol_needed)
-
-    def set_igmp_snooping_state(self, state):
-        state = bool(state)
-        other_config = {
-            'mcast-snooping-disable-flood-unregistered': 'false'}
-        with self.ovsdb.transaction() as txn:
-            txn.add(
-                self.ovsdb.db_set('Bridge', self.br_name,
-                                  ('mcast_snooping_enable', state)))
-            txn.add(
-                self.ovsdb.db_set('Bridge', self.br_name,
-                                  ('other_config', other_config)))
-
-    def set_igmp_snooping_flood(self, port_name, state):
-        state = str(state)
-        other_config = {
-            'mcast-snooping-flood-reports': state,
-            'mcast-snooping-flood': state}
-        self.ovsdb.db_set(
-            'Port', port_name,
-            ('other_config', other_config)).execute(
-                check_error=True, log_errors=True)
 
     def create(self, secure_mode=False):
         other_config = {
@@ -326,8 +287,7 @@ class OVSBridge(BaseOVS):
             # transactions
             txn.add(
                 self.ovsdb.db_add('Bridge', self.br_name,
-                                  'protocols',
-                                  *self.initial_protocols))
+                                  'protocols', self._highest_protocol_needed))
             txn.add(
                 self.ovsdb.db_set('Bridge', self.br_name,
                                   ('other_config', other_config)))
@@ -524,8 +484,6 @@ class OVSBridge(BaseOVS):
                         dont_fragment=True,
                         tunnel_csum=False,
                         tos=None):
-        if tunnel_type == p_const.TYPE_GRE:
-            tunnel_type = get_gre_tunnel_port_type(remote_ip, local_ip)
         attrs = [('type', tunnel_type)]
         # TODO(twilson) This is an OrderedDict solely to make a test happy
         options = collections.OrderedDict()
@@ -549,10 +507,6 @@ class OVSBridge(BaseOVS):
             options['csum'] = str(tunnel_csum).lower()
         if tos:
             options['tos'] = str(tos)
-        if tunnel_type == TYPE_GRE_IP6:
-            # NOTE(slaweq) According to the OVS documentation L3 GRE tunnels
-            # over IPv6 are not supported.
-            options['packet_type'] = 'legacy_l2'
         attrs.append(('options', options))
 
         return self.add_port(port_name, *attrs)
@@ -736,8 +690,8 @@ class OVSBridge(BaseOVS):
         self.set_controller_field('inactivity_probe', interval * 1000)
 
     def _set_egress_bw_limit_for_port(self, port_name, max_kbps,
-                                      max_burst_kbps, check_error=True):
-        with self.ovsdb.transaction(check_error=check_error) as txn:
+                                      max_burst_kbps):
+        with self.ovsdb.transaction(check_error=True) as txn:
             txn.add(self.ovsdb.db_set('Interface', port_name,
                                       ('ingress_policing_rate', max_kbps)))
             txn.add(self.ovsdb.db_set('Interface', port_name,
@@ -764,7 +718,8 @@ class OVSBridge(BaseOVS):
     def delete_egress_bw_limit_for_port(self, port_name):
         if not self.port_exists(port_name):
             return
-        self._set_egress_bw_limit_for_port(port_name, 0, 0, check_error=False)
+        self._set_egress_bw_limit_for_port(
+            port_name, 0, 0)
 
     def find_qos(self, port_name):
         qos = self.ovsdb.db_find(
@@ -935,11 +890,12 @@ class OVSBridge(BaseOVS):
         return max_kbps, max_burst_kbit
 
     def delete_ingress_bw_limit_for_port(self, port_name):
-        self.ovsdb.db_clear('Port', port_name,
-                            'qos').execute(check_error=False)
         qos = self.find_qos(port_name)
         queue = self.find_queue(port_name, QOS_DEFAULT_QUEUE)
+        does_port_exist = self.port_exists(port_name)
         with self.ovsdb.transaction(check_error=True) as txn:
+            if does_port_exist:
+                txn.add(self.ovsdb.db_clear("Port", port_name, 'qos'))
             if qos:
                 txn.add(self.ovsdb.db_destroy('QoS', qos['_uuid']))
             if queue:
